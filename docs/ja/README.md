@@ -46,7 +46,7 @@ GitHub 上でも「This branch is N commits behind PVi1:master」と出るので
 | 1 | **相関項の再構成**（遅いメーター対応の中核） | 設計中 |
 | 2 | 3 相 → 単相 3 線式 | 設計中 |
 | 3 | Shelly → echonetlite2mqtt | 未着手 |
-| 4 | 定数（ブレーカー 20A → 上限 16A） | 未着手 |
+| 4 | 定数（`twc_breaker_limit_a` 等。値は `secrets.yaml` 側） | 未着手 |
 
 **ハード側は改造不要。** 基板（Waveshare ESP32-S3-RS485-CAN）・ピン配（GPIO17/18/21）・`flash_size: 16MB`・`psram: mode: octal` はいずれも上流のままで一致している。
 

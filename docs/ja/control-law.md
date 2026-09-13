@@ -204,7 +204,7 @@ vitals_a/b/c, vitals_vehicle, contactor_closed, car_charging, grace_active
 | **1** | **相関項の再構成**（中核） | **✓ 実装済み（後述）** |
 | **2** | **3 相 → 単相** | 本件は単相 3 線式（L1 / L2/N）。`_b` / `_c` の扱いと、`desired_avail` の最弱相ロジックを単相に縮退させる。**⚠ 3 レジスタへの対称公表は維持する**（TWC3 が単相コミッショニングで実際にどのレジスタを読むか不明なため、対称が唯一安全） |
 | **3** | **Shelly → echonetlite2mqtt** | HA エンティティ名の差し替え。**⚠ 符号の向きを必ず確認する**（ECHONET の瞬時電力は ＋が買電） |
-| **4** | 定数 | `twc_breaker_limit_a: 16`（ブレーカー設定 20A の 80%）。`min_charge_current_a` は実測で確認 |
+| **4** | 定数 | `twc_breaker_limit_a` は **Tesla 施工メニューで TWC3 に設定した値と厳密に一致**させる（＝ブレーカー定格の 80%）。**具体値は `secrets.yaml` に置き、リポジトリには書かない**（上流もそうしている）。`min_charge_current_a` は実測で確認 |
 
 **⚠ ハード側は改造不要**：`board` / `flash_size: 16MB` / `psram: mode: octal` / ピン配（GPIO17/18/21）はいずれも上流のままで本件の基板と一致している。
 
