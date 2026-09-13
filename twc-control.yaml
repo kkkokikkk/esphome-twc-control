@@ -205,6 +205,23 @@ substitutions:
   twc_vitals_ip: !secret twc_vitals_ip
   twc_vitals_poll_interval: "2000ms"
 
+  # --- JP fork: phase count ----------------------------------------------
+  # "3" = upstream (three-phase, phases A/B/C all live).
+  # "1" = single-phase: ONLY phase A participates. B and C are ignored
+  #       everywhere -- availability checks, the desired_avail reductions,
+  #       the main-breaker clamp and the correlation term.
+  #
+  # On a Japanese 単相3線式 (split-phase 100/100V, 200V across the two line
+  # conductors) the wallbox is a single 200V load, so the natural "phase" is
+  # the 200V circuit itself: ONE current, not two. Feed phase A with the
+  # whole-installation signed value and leave B/C unbound.
+  #
+  # NOTE: publication stays SYMMETRIC on all 3 Modbus registers regardless.
+  # Which CT registers a wallbox commissioned single-phase actually reads is
+  # unknown, and symmetric publication is the only form that is correct for
+  # a CT1-only reader, an averaging reader and a max reader at once.
+  phase_count: "3"
+
   # --- JP fork: slow-meter correlation reconstruction --------------------
   # This fork runs against a Japanese smart meter read over ECHONET Lite
   # B-route (echonetlite2mqtt), which updates every 30-60s -- not the 1s
@@ -686,9 +703,19 @@ script:
           // HA-reported outage (e.g. Shelly on a flaky powerline/mesh
           // link) doesn't immediately trip the fail-safe; only a
           // continuous outage past shelly_unavailable_debounce_ms does.
-          bool all_available = id(ha_current_a_available) && id(ha_current_b_available) &&
-              id(ha_current_c_available) && id(ha_power_a_available) &&
-              id(ha_power_b_available) && id(ha_power_c_available);
+          // JP fork: with phase_count=1 only phase A is bound to a real HA
+          // entity -- B/C would sit permanently "unavailable" and pin the
+          // fail-safe on forever, so they are excluded from the check.
+          constexpr int kPhaseCount = ${phase_count};
+          bool all_available = id(ha_current_a_available) && id(ha_power_a_available);
+          if (kPhaseCount > 1) {
+            all_available = all_available && id(ha_current_b_available) &&
+                id(ha_power_b_available);
+          }
+          if (kPhaseCount > 2) {
+            all_available = all_available && id(ha_current_c_available) &&
+                id(ha_power_c_available);
+          }
           if (!all_available) {
             if (id(shelly_unavailable_since_ms) == 0) id(shelly_unavailable_since_ms) = now_ms;
           } else {
@@ -857,19 +884,31 @@ script:
             float desired_avail;
             if (grid_mode) {
               desired_avail = twc_breaker;
+            } else if (kPhaseCount == 1) {
+              // JP fork: single-phase -- phase A IS the whole installation,
+              // so there is nothing to average or take a minimum over.
+              // Both billing modes collapse to the same expression.
+              desired_avail = -household_a + fve_offset_a;
             } else if (id(aggregate_balance_metering).state) {
               // Aggregate/net billing: utility nets import/export across
-              // all 3 phases together, so average the household-only
-              // availability across all 3.
-              desired_avail = ((-household_a + fve_offset_a) +
-                                (-household_b + fve_offset_a) +
-                                (-household_c + fve_offset_a)) / 3.0f;
+              // all phases together, so average the household-only
+              // availability across them.
+              // JP fork: divided by kPhaseCount, not a hard-coded 3 -- with
+              // an inactive phase counted in, the budget would be scaled
+              // down by the ratio of live to total phases.
+              float sum = (-household_a + fve_offset_a) +
+                          (-household_b + fve_offset_a);
+              if (kPhaseCount > 2) sum += (-household_c + fve_offset_a);
+              desired_avail = sum / (float)kPhaseCount;
             } else {
               // Per-phase billing: the weakest phase is the true
               // constraint.
-              desired_avail = std::min(std::min(-household_a + fve_offset_a,
-                                                 -household_b + fve_offset_a),
-                                        -household_c + fve_offset_a);
+              desired_avail = std::min(-household_a + fve_offset_a,
+                                       -household_b + fve_offset_a);
+              if (kPhaseCount > 2) {
+                desired_avail = std::min(desired_avail,
+                                         -household_c + fve_offset_a);
+              }
             }
             desired_avail = std::min(desired_avail, twc_breaker);
 
@@ -931,10 +970,19 @@ script:
             // eliminating the feedback loop entirely. fabsf because a
             // breaker trips on current magnitude regardless of direction
             // (import or export).
-            float avail_main_a = main_breaker - fabsf(household_a);
-            float avail_main_b = main_breaker - fabsf(household_b);
-            float avail_main_c = main_breaker - fabsf(household_c);
-            float avail_main_min = std::min(std::min(avail_main_a, avail_main_b), avail_main_c);
+            // JP fork: only live phases participate -- an unbound phase
+            // sits at household=0, which would read as "full headroom" and
+            // silently never constrain (harmless here, but it also makes
+            // the intent unclear). Gate it explicitly.
+            float avail_main_min = main_breaker - fabsf(household_a);
+            if (kPhaseCount > 1) {
+              avail_main_min = std::min(avail_main_min,
+                                        main_breaker - fabsf(household_b));
+            }
+            if (kPhaseCount > 2) {
+              avail_main_min = std::min(avail_main_min,
+                                        main_breaker - fabsf(household_c));
+            }
             desired_avail = std::min(desired_avail, avail_main_min);
 
             // Publication law -- see the comment block above script: for
@@ -943,7 +991,12 @@ script:
             // car-INCLUSIVE signal for live 1:1 correlation below the
             // limit; compressed-and-capped excess above it; published
             // SYMMETRICALLY on all 3 registers.
-            float worst = std::max(std::max(corr_a, corr_b), corr_c);
+            // JP fork: reduce over live phases only. With phase_count=1,
+            // corr_b/corr_c are derived from unbound inputs and must not
+            // be able to win this max.
+            float worst = corr_a;
+            if (kPhaseCount > 1) worst = std::max(worst, corr_b);
+            if (kPhaseCount > 2) worst = std::max(worst, corr_c);
             float bias_offset = twc_breaker - desired_avail;
             // worst is only added while the car is actually drawing
             // current (car_charging) -- that's when reported MUST track

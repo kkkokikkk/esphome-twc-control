@@ -43,8 +43,8 @@ GitHub 上でも「This branch is N commits behind PVi1:master」と出るので
 
 | # | 項目 | 状態 |
 |---|---|---|
-| 1 | **相関項の再構成**（遅いメーター対応の中核） | 設計中 |
-| 2 | 3 相 → 単相 3 線式 | 設計中 |
+| 1 | **相関項の再構成**（遅いメーター対応の中核） | **✓ 実装済み**（既定 OFF の切替式） |
+| 2 | 3 相 → 単相 3 線式 | **✓ 実装済み**（`phase_count`、既定 `"3"`） |
 | 3 | Shelly → echonetlite2mqtt | 未着手 |
 | 4 | 定数（`twc_breaker_limit_a` 等。値は `secrets.yaml` 側） | 未着手 |
 
