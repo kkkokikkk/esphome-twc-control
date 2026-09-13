@@ -52,7 +52,4 @@ GitHub 上でも「This branch is N commits behind PVi1:master」と出るので
 
 ## 背景資料
 
-本件の設計判断・実測データ・先行プロジェクトの調査は、別リポジトリ `Esp32s3-evse` の以下にまとめてある：
-
-- `hardware/Reference/design_notes.md` — 設計判断と TODO の本体
-- `twc-rs485/reference/` — LoadPilot / PVi1 / Klangen82 の README・BEHAVIOR・issue の日本語訳と、**ファーム 26.26 についての整合まとめ**
+設計判断の経緯・実測データ・先行プロジェクト（tesla-loadpilot / esphome-twc-control / tesla-wall-connector-control）の調査は、**別途プライベートに管理している**。本ディレクトリには、このフォークを読むのに必要な内容だけを置く。
