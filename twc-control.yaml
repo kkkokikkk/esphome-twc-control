@@ -205,6 +205,21 @@ substitutions:
   twc_vitals_ip: !secret twc_vitals_ip
   twc_vitals_poll_interval: "2000ms"
 
+  # --- JP fork: slow-meter correlation reconstruction --------------------
+  # This fork runs against a Japanese smart meter read over ECHONET Lite
+  # B-route (echonetlite2mqtt), which updates every 30-60s -- not the 1s
+  # Shelly this project was built around. See docs/ja/control-law.md.
+  #
+  # How long a vitals sample stays usable for the reconstruction. The
+  # reconstruction ADDS vitals to a HELD household snapshot, so a stale
+  # vitals value would be double-counted (the snapshot already contains
+  # the car as it was at snapshot time). Past this age we fall back to the
+  # upstream max() form, which can only ever push "reported" UP and is
+  # therefore safe even with a stale input.
+  # 3x the 2s poll interval -- tolerates a couple of missed polls without
+  # flapping.
+  twc_vitals_stale_ms: "6000"
+
 esp32:
   board: esp32-s3-devkitc-1
   variant: esp32s3
@@ -439,6 +454,49 @@ globals:
     type: bool
     restore_value: no
     initial_value: "false"
+
+  # --- JP fork: vitals freshness stamp ---
+  # Upstream never needed this: vitals only fed max()-style floors, where a
+  # stale value is harmless (it can only fail to raise the floor). The
+  # slow-meter reconstruction ADDS vitals, so a stale value would be
+  # double-counted -- hence an explicit age check. 0 = never succeeded.
+  - id: twc_vitals_last_ok_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  # --- JP fork: household snapshot for the slow-meter reconstruction ---
+  # household_snap_x = signed_x - vitals_x, both sampled AT THE SAME MOMENT
+  # (when a new meter value arrives). Held between meter updates, so the
+  # published correlation term can be rebuilt as
+  #   corr_x = household_snap_x + vitals_now_x
+  # which tracks the car's ramp 1:1 at the vitals cadence regardless of how
+  # slow the meter is. NAN = no valid snapshot yet (falls back to upstream).
+  - id: household_snap_a
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+  - id: household_snap_b
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+  - id: household_snap_c
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+  # Bumped by every meter on_value handler; compared against
+  # household_snap_seq so the snapshot is refreshed exactly when genuinely
+  # new meter data has arrived -- not on every recompute_ct call (which
+  # would defeat the hold) and not by value comparison (a genuinely
+  # unchanged reading is still a fresh sample).
+  - id: meter_seq
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: household_snap_seq
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
 
   # --- Real per-phase current/power (Shelly Pro 3EM on the main incomer,
   #     includes the TWC branch too), mirrored in from HA entities --
@@ -699,6 +757,41 @@ script:
             float household_b = signed_b - id(twc_vitals_current_b);
             float household_c = signed_c - id(twc_vitals_current_c);
 
+            // ---- JP fork: slow-meter household snapshot ----------------
+            // With a 1s meter, signed_x and vitals_x are effectively
+            // simultaneous, so the subtraction above is correct as-is.
+            //
+            // With a 30-60s meter (ECHONET B-route) it is NOT: signed_x is
+            // up to a minute old while vitals_x is 2s old, so subtracting
+            // "the car now" from "the total a minute ago" removes an amount
+            // the old total never contained. During a ramp that error is
+            // several amps.
+            //
+            // Fix: capture BOTH at the same instant -- refresh the snapshot
+            // only when genuinely new meter data has arrived (meter_seq).
+            // Between meter updates the snapshot is HELD: it is the
+            // household as it was when last measured, which is exactly the
+            // slow quantity desired_avail is supposed to track.
+            const bool vitals_fresh = (id(twc_vitals_last_ok_ms) != 0) &&
+                (now_ms - id(twc_vitals_last_ok_ms) <= (uint32_t)${twc_vitals_stale_ms});
+            const bool slow_corr = id(slow_meter_corr).state && vitals_fresh;
+            if (id(meter_seq) != id(household_snap_seq)) {
+              id(household_snap_seq) = id(meter_seq);
+              // Snapshot uses the vitals reading contemporaneous with this
+              // meter sample. If vitals is stale we still snapshot (the
+              // value is the best we have) but slow_corr is gated off
+              // above, so it will not be used additively until vitals is
+              // healthy again.
+              id(household_snap_a) = signed_a - id(twc_vitals_current_a);
+              id(household_snap_b) = signed_b - id(twc_vitals_current_b);
+              id(household_snap_c) = signed_c - id(twc_vitals_current_c);
+            }
+            if (slow_corr && !std::isnan(id(household_snap_a))) {
+              household_a = id(household_snap_a);
+              household_b = id(household_snap_b);
+              household_c = id(household_snap_c);
+            }
+
             // R1 hard floor -- CORRELATION-ONLY, per the reference
             // project: with the car genuinely charging, TWC3's own live
             // ramp-tracking check needs the published "worst" term to
@@ -726,9 +819,36 @@ script:
                 (id(twc_vitals_vehicle_current) >= 2.0f);
             float corr_a = signed_a, corr_b = signed_b, corr_c = signed_c;
             if (car_charging) {
-              corr_a = std::max(corr_a, id(twc_vitals_current_a));
-              corr_b = std::max(corr_b, id(twc_vitals_current_b));
-              corr_c = std::max(corr_c, id(twc_vitals_current_c));
+              if (slow_corr && !std::isnan(id(household_snap_a))) {
+                // ---- JP fork: additive reconstruction ------------------
+                // max() is enough ONLY while signed_x itself moves with the
+                // car's ramp -- true with a 1s meter. With a 30-60s meter
+                // it is not: whenever the household load is larger than the
+                // car's own draw, max() picks the STALE signed_x, and the
+                // published value stops echoing TWC3's ramp. That is
+                // distrust entry path #2 (a ramp absorbed by a flat
+                // published value), and it latches.
+                //
+                // Rebuilding the total instead -- held household + live car
+                // -- tracks the ramp 1:1 at the vitals cadence no matter
+                // how large the household term is. It also degrades
+                // gracefully: with a fast meter the snapshot is always
+                // current, so this equals signed_x anyway.
+                corr_a = id(household_snap_a) + id(twc_vitals_current_a);
+                corr_b = id(household_snap_b) + id(twc_vitals_current_b);
+                corr_c = id(household_snap_c) + id(twc_vitals_current_c);
+                // Never publish below what TWC3 itself measures the car
+                // drawing -- the upstream R1 invariant still applies, and
+                // it also covers a negative (exporting) snapshot.
+                corr_a = std::max(corr_a, id(twc_vitals_current_a));
+                corr_b = std::max(corr_b, id(twc_vitals_current_b));
+                corr_c = std::max(corr_c, id(twc_vitals_current_c));
+              } else {
+                // Upstream R1 hard floor (fast meter, or vitals stale).
+                corr_a = std::max(corr_a, id(twc_vitals_current_a));
+                corr_b = std::max(corr_b, id(twc_vitals_current_b));
+                corr_c = std::max(corr_c, id(twc_vitals_current_c));
+              }
             }
 
             // Desired available current -- how much we WANT the car
@@ -1197,10 +1317,11 @@ script:
                     "ts_ms,mode,real_a,real_b,real_c,signed_a,signed_b,signed_c,"
                     "corr_a,corr_b,corr_c,household_a,household_b,household_c,"
                     "desired_avail,worst,o_raw,pub,"
-                    "fve_offset_kw,vitals_a,vitals_b,vitals_c,vitals_vehicle,contactor_closed,car_charging,grace_active");
+                    "fve_offset_kw,vitals_a,vitals_b,vitals_c,vitals_vehicle,contactor_closed,car_charging,grace_active,"
+                    "slow_corr,vitals_fresh,snap_a,snap_b,snap_c");
               }
               ESP_LOGI("csv",
-                  "%u,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d",
+                  "%u,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%d,%.2f,%.2f,%.2f",
                   now_ms, mode_str, real_a, real_b, real_c,
                   signed_a, signed_b, signed_c,
                   corr_a, corr_b, corr_c,
@@ -1208,7 +1329,9 @@ script:
                   desired_avail, worst, o_raw, pub, fve_offset_kw,
                   id(twc_vitals_current_a), id(twc_vitals_current_b), id(twc_vitals_current_c),
                   id(twc_vitals_vehicle_current), id(twc_vitals_contactor_closed) ? 1 : 0,
-                  car_charging ? 1 : 0, grace_active ? 1 : 0);
+                  car_charging ? 1 : 0, grace_active ? 1 : 0,
+                  slow_corr ? 1 : 0, vitals_fresh ? 1 : 0,
+                  id(household_snap_a), id(household_snap_b), id(household_snap_c));
             }
 
             // Escalation (secondary safety net): a 2-stage STEP function
@@ -1334,6 +1457,37 @@ switch:
     icon: "mdi:stairs"
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
+
+# ---------------------------------------------------------------------------
+# JP fork: slow-meter correlation reconstruction (see recompute_ct and
+# docs/ja/control-law.md).
+#
+# OFF = upstream behaviour: household_x = signed_x - vitals_x recomputed
+#       every call, and corr_x = max(signed_x, vitals_x). Correct when the
+#       meter is fast enough that signed_x itself follows the car's ramp
+#       (the 1s Shelly this project was built around).
+#
+# ON  = hold a household snapshot captured together with the vitals reading
+#       at each new meter sample, and rebuild the published correlation term
+#       as household_snap + vitals_now. Needed when the meter is slow (this
+#       fork: ECHONET B-route at 30-60s), where max() would otherwise pick a
+#       stale signed_x whenever the household load exceeds the car's draw,
+#       stop echoing TWC3's ramp, and latch distrust.
+#
+# Runtime-switchable on purpose: which form behaves better on a slow meter
+# has NOT been measured yet, and flipping it lets stage-2 bring-up A/B the
+# two without reflashing. Gated off automatically whenever vitals is stale
+# (twc_vitals_stale_ms), since the additive form would double-count.
+#
+# Default OFF = upstream behaviour, so a fresh flash never silently runs an
+# unvalidated law.
+# ---------------------------------------------------------------------------
+  - platform: template
+    id: slow_meter_corr
+    name: "Slow Meter Correlation"
+    icon: "mdi:speedometer-slow"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
 
 # ---------------------------------------------------------------------------
 # Runtime-adjustable manual export-balance offset (FVE modes only, see
@@ -1583,6 +1737,11 @@ interval:
                           if (root["currentC_a"].is<float>()) id(twc_vitals_current_c) = root["currentC_a"];
                           if (root["vehicle_current_a"].is<float>()) id(twc_vitals_vehicle_current) = root["vehicle_current_a"];
                           if (root["contactor_closed"].is<bool>()) id(twc_vitals_contactor_closed) = root["contactor_closed"];
+                          // JP fork: stamp freshness -- the slow-meter
+                          // reconstruction in recompute_ct adds vitals to a
+                          // held snapshot and must not do so with a stale
+                          // value (see twc_vitals_stale_ms).
+                          id(twc_vitals_last_ok_ms) = millis();
                           return true;
                         });
                         ESP_LOGI("vitals", "TWC vitals: A=%.2f B=%.2f C=%.2f vehicle=%.2f contactor=%s",
@@ -1744,6 +1903,7 @@ sensor:
               id(shelly_a_current) = id(real_a_trusted);
               id(shelly_last_ok_ms) = millis();
               id(ha_current_a_available) = true;
+              id(meter_seq)++;  // JP fork: new meter sample -> re-snapshot household
             }
         - script.execute: recompute_ct
   - platform: homeassistant
@@ -1780,6 +1940,7 @@ sensor:
               id(shelly_b_current) = id(real_b_trusted);
               id(shelly_last_ok_ms) = millis();
               id(ha_current_b_available) = true;
+              id(meter_seq)++;  // JP fork: new meter sample -> re-snapshot household
             }
         - script.execute: recompute_ct
   - platform: homeassistant
@@ -1816,6 +1977,7 @@ sensor:
               id(shelly_c_current) = id(real_c_trusted);
               id(shelly_last_ok_ms) = millis();
               id(ha_current_c_available) = true;
+              id(meter_seq)++;  // JP fork: new meter sample -> re-snapshot household
             }
         - script.execute: recompute_ct
   # act_power: negative = export to grid, positive = import from grid (same convention as before)
@@ -1833,6 +1995,7 @@ sensor:
               id(shelly_a_power) = x;
               id(shelly_last_ok_ms) = millis();
               id(ha_power_a_available) = true;
+              id(meter_seq)++;  // JP fork: new meter sample -> re-snapshot household
             }
         - script.execute: recompute_ct
   - platform: homeassistant
@@ -1849,6 +2012,7 @@ sensor:
               id(shelly_b_power) = x;
               id(shelly_last_ok_ms) = millis();
               id(ha_power_b_available) = true;
+              id(meter_seq)++;  // JP fork: new meter sample -> re-snapshot household
             }
         - script.execute: recompute_ct
   - platform: homeassistant
@@ -1865,6 +2029,7 @@ sensor:
               id(shelly_c_power) = x;
               id(shelly_last_ok_ms) = millis();
               id(ha_power_c_available) = true;
+              id(meter_seq)++;  // JP fork: new meter sample -> re-snapshot household
             }
         - script.execute: recompute_ct
 
