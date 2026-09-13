@@ -39,14 +39,14 @@ GitHub 上でも「This branch is N commits behind PVi1:master」と出るので
 |---|---|
 | [`control-law.md`](control-law.md) | **公表則（`recompute_ct`）の全体解説。** データの流れ、主要変数、中核の 3 行、R1 ハードフロア、`desired_avail` の作り方、エスカレーション、ゾーンステアリング、フェイルセーフ、デバッグ用 CSV ログ、そして**日本向けに変える必要がある 4 点** |
 
-## 日本向けの差分（設計中）
+## 日本向けの差分
 
 | # | 項目 | 状態 |
 |---|---|---|
 | 1 | **相関項の再構成**（遅いメーター対応の中核） | **✓ 実装済み**（既定 OFF の切替式） |
 | 2 | 3 相 → 単相 3 線式 | **✓ 実装済み**（`phase_count`、既定 `"3"`） |
-| 3 | Shelly → echonetlite2mqtt | 未着手 |
-| 4 | 定数（`twc_breaker_limit_a` 等。値は `secrets.yaml` 側） | 未着手 |
+| 3 | Shelly → echonetlite2mqtt | **✓ 方針確定**（HA 側のテンプレートで換算。ファーム変更なし） |
+| 4 | 定数（`grid_voltage_v` の substitution 化ほか） | **✓ 実装済み** |
 
 **ハード側は改造不要。** 基板（Waveshare ESP32-S3-RS485-CAN）・ピン配（GPIO17/18/21）・`flash_size: 16MB`・`psram: mode: octal` はいずれも上流のままで一致している。
 

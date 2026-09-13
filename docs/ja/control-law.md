@@ -203,8 +203,8 @@ vitals_a/b/c, vitals_vehicle, contactor_closed, car_charging, grace_active
 |---|---|---|
 | **1** | **相関項の再構成**（中核） | **✓ 実装済み（後述）** |
 | **2** | **3 相 → 単相** | **✓ 実装済み（後述）** |
-| **3** | **Shelly → echonetlite2mqtt** | HA エンティティ名の差し替え。**⚠ 符号の向きを必ず確認する**（ECHONET の瞬時電力は ＋が買電） |
-| **4** | 定数 | `twc_breaker_limit_a` は **Tesla 施工メニューで TWC3 に設定した値と厳密に一致**させる（＝ブレーカー定格の 80%）。**具体値は `secrets.yaml` に置き、リポジトリには書かない**（上流もそうしている）。`min_charge_current_a` は実測で確認 |
+| **3** | **Shelly → echonetlite2mqtt** | **✓ 方針確定（後述）。ファーム変更なし——HA のテンプレートセンサーで換算する** |
+| **4** | 定数 | **✓ 実装済み（後述）。** `voltage` を substitution 化し、`fve_offset` の実バグを修正 |
 
 **⚠ ハード側は改造不要**：`board` / `flash_size: 16MB` / `psram: mode: octal` / ピン配（GPIO17/18/21）はいずれも上流のままで本件の基板と一致している。
 
@@ -321,3 +321,109 @@ ESPHome の substitution は**コンパイル時のテキスト置換**なので
 - **C++ の実コンパイルは未実施**（開発環境の制約。項目 1 と同じ）
 - **`esphome config` は `phase_count` が `"3"` と `"1"` の両方で通ることを確認済み**
 - **単相での実機挙動は、先行プロジェクトを含めて誰も測っていない**（上流の TESTPLAN でも単相ケースは全て未実施）。**ここは本当に未踏**
+
+---
+
+## 16. 実装済み：電圧の定数化と kW オフセットの相数対応（項目 4）
+
+上流は `const float voltage = 230.0f;` を**ハードコード**していた（欧州の相電圧）。これを `grid_voltage_v` の substitution に出した（既定 `"230"` ＝上流のまま）。
+
+**「1 相」が何を指すかは設置による。** 単相 3 線式ではウォールコネクターが 2 本の線間 200V に繋がる単一負荷なので、**「1 相」＝その 200V 回路**。よって `200`。
+
+使われる先は 2 箇所：
+
+1. **手動 kW オフセット → アンペア換算**
+2. **Modbus で公表する相ごと電力レジスタ**（`0x88` / `0x8A` / `0x8C`）
+
+### 🚨 ついでに実バグを 1 つ直した
+
+```cpp
+// 変更前（上流）
+fve_offset_a = fve_offset_kw * 1000.0f / 3.0f / voltage;   // 3 で固定
+// 変更後
+fve_offset_a = fve_offset_kw * 1000.0f / (float)kPhaseCount / voltage;
+```
+
+**`3.0f` が固定だった。** 単相（`phase_count: "1"`）だと、**1kW のオフセットが 5A ではなく 1.67A にしかならない**——**3 倍の過小**。上流は 3 相しか想定していないので上流ではバグではないが、単相化した時点でバグになる。
+
+---
+
+## 17. 実装方針：echonetlite2mqtt への接続（項目 3）
+
+### ⚠ ファームウェアは変更しない
+
+**ファームが求めている入力は 2 つだけ**で、それはそのまま用意できる：
+
+| ファーム側の入力 | 意味 | 何を渡すか |
+|---|---|---|
+| `ha_current_a_entity` | **電流の大きさ**（A、符号なし） | **グリッド潮流の 200V 換算電流** |
+| `ha_power_a_entity` | **符号付き電力**（**符号しか見ていない**） | 瞬時電力計測値（＋が買電） |
+
+**→ 換算は Home Assistant 側のテンプレートセンサーでやる。** ファームに手を入れるより、上流との差分が増えず、値が HA 上で目視できる分デバッグもしやすい。
+
+### なぜ「電流をそのまま使わない」のか
+
+ECHONET の `instantaneousCurrent` は **R 相・T 相の 2 値**で、単相 3 線式では **100V 負荷が片側だけに乗る**ため左右非対称になる。一方 `vitals` から来る車の電流は **200V 回路の 1 つの値**。**単位の基準が違うので、そのまま引き算できない。**
+
+**電力から換算すれば基準が揃う。**
+
+```
+signed_a  = 瞬時電力計測値 [W] / 200V      ← ＋が買電
+vitals_a  = vehicle_current_a             ← 車の 200V 回路電流
+household = signed_a − vitals_a           ← 単位が揃うので引き算が成立
+```
+
+**検算**（家が 3kW 売電、車が 11.8A ＝ 2.36kW を引いている状態）：
+
+```
+系統潮流 = −3000 + 2360 = −640W
+signed_a = −640 / 200 = −3.2A
+household = −3.2 − 11.8 = −15.0A → 15.0A × 200V = 3000W の売電 ✓
+```
+
+### HA 側に置くテンプレートセンサー
+
+```yaml
+template:
+  - sensor:
+      # ファームの ha_current_a_entity に渡す（大きさだけ）
+      - name: "Grid current equivalent"
+        unique_id: grid_current_equivalent
+        unit_of_measurement: "A"
+        device_class: current
+        state_class: measurement
+        state: >
+          {% set p = states('sensor.<瞬時電力計測値のエンティティ>') | float(0) %}
+          {{ (p / 200) | abs | round(2) }}
+        availability: >
+          {{ states('sensor.<瞬時電力計測値のエンティティ>') not in
+             ['unknown', 'unavailable', 'none'] }}
+```
+
+**⚠ `availability` を必ず書くこと。** ファーム側のフェイルセーフは「**HA が報告する `unavailable` / `unknown`**」で判定している（無更新タイムアウトではない）。これが無いと、**元データが死んでも 0 を返し続けてフェイルセーフが働かない**。
+
+`ha_power_a_entity` には**瞬時電力計測値のエンティティをそのまま**渡す（符号しか使われない）。
+
+### `secrets.yaml` の設定例
+
+```yaml
+phase_count は twc-control.yaml 側（"1"）
+grid_voltage_v も twc-control.yaml 側（"200"）
+
+ha_current_a_entity: "sensor.grid_current_equivalent"   # 上のテンプレート
+ha_current_b_entity: "sensor.grid_current_equivalent"   # A と同じ（未使用）
+ha_current_c_entity: "sensor.grid_current_equivalent"   # A と同じ（未使用）
+ha_power_a_entity:   "sensor.<瞬時電力計測値>"
+ha_power_b_entity:   "sensor.<瞬時電力計測値>"           # A と同じ（未使用）
+ha_power_c_entity:   "sensor.<瞬時電力計測値>"           # A と同じ（未使用）
+```
+
+**B/C は `phase_count: "1"` で判定から完全に除外されている**ので、A と同じものを指しておけば「常に available」になり警告も出ない。
+
+### ⚠ 符号の向きは実機で必ず確認する
+
+**ECHONET の瞬時電力計測値は「＋が買電、−が売電」**という理解で実装しているが、**機器・設定によって逆のことがある**。
+
+**確認方法**：晴天の昼に売電しているはずの時刻で、HA 上の値が**負**になっていること。逆なら HA のテンプレート側で符号を反転する（ファームには触らない）。
+
+**⚠ ここを間違えると、余剰があるのに充電を絞り、買電しているのに充電を増やす**——**制御が完全に逆転する。** 最初に確認すべき 1 点。

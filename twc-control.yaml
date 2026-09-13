@@ -222,6 +222,16 @@ substitutions:
   # a CT1-only reader, an averaging reader and a max reader at once.
   phase_count: "3"
 
+  # --- JP fork: nominal phase voltage ------------------------------------
+  # Upstream hard-coded 230.0f (European three-phase, phase-to-neutral).
+  # Used for (a) converting the manual kW offset into amps and (b) the
+  # per-phase power registers published over Modbus.
+  #
+  # Set to the voltage of whatever "one phase" means in YOUR install. On a
+  # Japanese 単相3線式 the wallbox is a single 200V load across the two line
+  # conductors, so "one phase" is that 200V circuit -> 200.
+  grid_voltage_v: "230"
+
   # --- JP fork: slow-meter correlation reconstruction --------------------
   # This fork runs against a Japanese smart meter read over ECHONET Lite
   # B-route (echonetlite2mqtt), which updates every 30-60s -- not the 1s
@@ -689,7 +699,7 @@ script:
       - lambda: |-
           const float twc_breaker = ${twc_breaker_limit_a};
           const float main_breaker = ${main_breaker_limit_a};
-          const float voltage = 230.0f;
+          const float voltage = ${grid_voltage_v};  // JP fork: was hard-coded 230.0f
           const uint32_t now_ms = millis();
 
           // Dither -- see dither_amplitude_a above -- computed once,
@@ -761,7 +771,12 @@ script:
             // value yet (falls back to 0 = no offset).
             float fve_offset_kw = id(fve_offset).state;
             if (std::isnan(fve_offset_kw)) fve_offset_kw = 0.0f;
-            const float fve_offset_a = fve_offset_kw * 1000.0f / 3.0f / voltage;
+            // JP fork: divided by kPhaseCount, not a hard-coded 3. The kW
+            // offset is split evenly across the live phases; with
+            // phase_count=1 the old form under-delivered by 3x (e.g. a
+            // 1kW offset became 1.67A instead of 5A at 200V).
+            const float fve_offset_a =
+                fve_offset_kw * 1000.0f / (float)kPhaseCount / voltage;
 
             // Signed net grid exchange per phase (positive = import,
             // negative = export) -- floored down only on the export side,
