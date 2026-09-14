@@ -220,6 +220,17 @@ substitutions:
   # Which CT registers a wallbox commissioned single-phase actually reads is
   # unknown, and symmetric publication is the only form that is correct for
   # a CT1-only reader, an averaging reader and a max reader at once.
+  #
+  # Signed vs unsigned: phase current here must be a MAGNITUDE (always
+  # positive). Upstream takes the sign from the matching power entity --
+  # `signed_a = (power_a < 0) ? -floorf(real_a) : real_a` -- because a
+  # Shelly reports current unsigned. If your meter reports SIGNED current
+  # (some ECHONET Lite 瞬時電流計測値 implementations do), feeding it in
+  # raw flips the sign AND inflates the magnitude: -floorf(-17.2) = +18.
+  # Take the absolute value on the HA side and let the power entity carry
+  # the sign. Deriving that power per-phase from the same signed current
+  # (I * V_phase) is better than reusing one whole-house total, because on
+  # split-phase the total can read export while one leg still imports.
   phase_count: "3"
 
   # --- JP fork: nominal phase voltage ------------------------------------
@@ -227,9 +238,25 @@ substitutions:
   # Used for (a) converting the manual kW offset into amps and (b) the
   # per-phase power registers published over Modbus.
   #
-  # Set to the voltage of whatever "one phase" means in YOUR install. On a
-  # Japanese 単相3線式 the wallbox is a single 200V load across the two line
-  # conductors, so "one phase" is that 200V circuit -> 200.
+  # Set to the voltage of whatever "one phase" means in YOUR install -- i.e.
+  # the voltage that, multiplied by ONE unit of phase_count, gives real
+  # power. It must be consistent with how you mapped phase_count.
+  #
+  # On a Japanese 単相3線式 (split-phase, 100/100V, 200V line-to-line) the
+  # natural mapping is phase_count: "2" with phase A = L1 and phase B = L2,
+  # because the main breaker trips PER LEG, so `worst = max(signed_a,
+  # signed_b, ...)` then means exactly "the worst leg" -- structurally
+  # identical to a 3-phase Shelly 3EM.
+  #
+  # With that mapping the voltage is 100, NOT 200. The kW offset is
+  # converted as kW*1000 / kPhaseCount / voltage, so a 2kW offset must come
+  # out as 10A per leg: 2000/2/100 = 10. Putting 200 here halves it.
+  #
+  # (Alternative mapping, only if your meter cannot give per-leg values:
+  # phase_count: "1" with the 200V circuit as the single phase -> 200. This
+  # UNDER-ESTIMATES leg imbalance and is not recommended when per-leg
+  # currents are available -- 100V loads sit on one leg at a time and the
+  # legs routinely differ by several amps.)
   grid_voltage_v: "230"
 
   # --- JP fork: slow-meter correlation reconstruction --------------------

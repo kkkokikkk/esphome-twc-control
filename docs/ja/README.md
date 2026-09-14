@@ -44,8 +44,8 @@ GitHub 上でも「This branch is N commits behind PVi1:master」と出るので
 | # | 項目 | 状態 |
 |---|---|---|
 | 1 | **相関項の再構成**（遅いメーター対応の中核） | **✓ 実装済み**（既定 OFF の切替式） |
-| 2 | 3 相 → 単相 3 線式 | **✓ 実装済み**（`phase_count`、既定 `"3"`） |
-| 3 | Shelly → echonetlite2mqtt | **✓ 方針確定**（HA 側のテンプレートで換算。ファーム変更なし） |
+| 2 | 3 相 → 単相 3 線式 | **✓ 実装済み**（`phase_count: "2"` ＋ `grid_voltage_v: "100"` で L1/L2 を脚として扱う。既定は上流のまま `"3"` / `"230"`） |
+| 3 | Shelly → echonetlite2mqtt | **✓ 方針確定**（HA 側のテンプレート 4 本＝脚ごとの `abs(電流)` と `電流×100`（符号運搬用の W）。ファーム変更なし。**符号付き電流をそのまま渡すと反転するので必ず `abs` を通す**） |
 | 4 | 定数（`grid_voltage_v` の substitution 化ほか） | **✓ 実装済み** |
 
 **ハード側は改造不要。** 基板（Waveshare ESP32-S3-RS485-CAN）・ピン配（GPIO17/18/21）・`flash_size: 16MB`・`psram: mode: octal` はいずれも上流のままで一致している。
