@@ -2382,3 +2382,5 @@ modbus_server:
       - { address: 40005, value_type: U_WORD, read_lambda: "return 0x6E65;" }
       - { address: 40006, value_type: U_WORD, read_lambda: "return 0x7261;" }
       - { address: 40007, value_type: U_WORD, read_lambda: "return 0x6300;" }
+
+captive_portal:
