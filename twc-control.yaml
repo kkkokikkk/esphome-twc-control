@@ -231,7 +231,7 @@ substitutions:
   # the sign. Deriving that power per-phase from the same signed current
   # (I * V_phase) is better than reusing one whole-house total, because on
   # split-phase the total can read export while one leg still imports.
-  phase_count: "3"
+  phase_count: "2"
 
   # --- JP fork: nominal phase voltage ------------------------------------
   # Upstream hard-coded 230.0f (European three-phase, phase-to-neutral).
@@ -257,7 +257,7 @@ substitutions:
   # UNDER-ESTIMATES leg imbalance and is not recommended when per-leg
   # currents are available -- 100V loads sit on one leg at a time and the
   # legs routinely differ by several amps.)
-  grid_voltage_v: "230"
+  grid_voltage_v: "100"
 
   # --- JP fork: slow-meter correlation reconstruction --------------------
   # This fork runs against a Japanese smart meter read over ECHONET Lite
@@ -272,7 +272,7 @@ substitutions:
   # therefore safe even with a stale input.
   # 3x the 2s poll interval -- tolerates a couple of missed polls without
   # flapping.
-  twc_vitals_stale_ms: "6000"
+  twc_vitals_stale_ms: "10000"
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -729,6 +729,18 @@ script:
           const float voltage = ${grid_voltage_v};  // JP fork: was hard-coded 230.0f
           const uint32_t now_ms = millis();
 
+          // [vitals 鮮度チェック 2026-09-24] 古い vitals は凍結した嘘なので 0 に落とし、
+          // 上流が定義済みのフォールバック（車込みの保守側の信号）へ倒す。実際 WC の
+          // 再起動中は車も止まっているので 0 が正しい値でもある。
+          if (id(twc_vitals_last_ok_ms) == 0 ||
+              (now_ms - id(twc_vitals_last_ok_ms)) > (uint32_t)${twc_vitals_stale_ms}) {
+            id(twc_vitals_current_a) = 0.0f;
+            id(twc_vitals_current_b) = 0.0f;
+            id(twc_vitals_current_c) = 0.0f;
+            id(twc_vitals_vehicle_current) = 0.0f;
+            id(twc_vitals_contactor_closed) = false;
+          }
+
           // Dither -- see dither_amplitude_a above -- computed once,
           // applied everywhere below (including fail-safe/disabled) so
           // "reported" is never perfectly static for long.
@@ -822,9 +834,14 @@ script:
             // (0.0 default) if vitals hasn't reported yet -- less
             // precise, still correct. IMPORTANT: uses the RAW signed_x
             // (no R1 floor applied -- see below for why).
-            float household_a = signed_a - id(twc_vitals_current_a);
-            float household_b = signed_b - id(twc_vitals_current_b);
-            float household_c = signed_c - id(twc_vitals_current_c);
+            // [単相ワークアラウンド 2026-09-21] 上流は相ごとに vitals_current_x を引くが、
+            // 単相 200V では WC が vehicle_current を A/B に按分して報告するため成立しない
+            // (実測: currentA 7.3 + currentB 8.6 = vehicle 15.9, currentN 15.9)。
+            // 単相では両脚に同じ電流が流れるので、按分値ではなく車の全電流を各脚から引く。
+            // 修正前は家庭負荷を約 8.6A 過大評価していた (HA 履歴で確認済み)。
+            float household_a = signed_a - id(twc_vitals_vehicle_current);
+            float household_b = signed_b - id(twc_vitals_vehicle_current);
+            float household_c = signed_c - id(twc_vitals_vehicle_current);
 
             // ---- JP fork: slow-meter household snapshot ----------------
             // With a 1s meter, signed_x and vitals_x are effectively
@@ -851,9 +868,10 @@ script:
               // value is the best we have) but slow_corr is gated off
               // above, so it will not be used additively until vitals is
               // healthy again.
-              id(household_snap_a) = signed_a - id(twc_vitals_current_a);
-              id(household_snap_b) = signed_b - id(twc_vitals_current_b);
-              id(household_snap_c) = signed_c - id(twc_vitals_current_c);
+              // [単相ワークアラウンド #7 2026-09-26] #4 と同じく按分値ではなく車の全電流を引く
+              id(household_snap_a) = signed_a - id(twc_vitals_vehicle_current);
+              id(household_snap_b) = signed_b - id(twc_vitals_vehicle_current);
+              id(household_snap_c) = signed_c - id(twc_vitals_vehicle_current);
             }
             if (slow_corr && !std::isnan(id(household_snap_a))) {
               household_a = id(household_snap_a);
@@ -903,9 +921,10 @@ script:
                 // how large the household term is. It also degrades
                 // gracefully: with a fast meter the snapshot is always
                 // current, so this equals signed_x anyway.
-                corr_a = id(household_snap_a) + id(twc_vitals_current_a);
-                corr_b = id(household_snap_b) + id(twc_vitals_current_b);
-                corr_c = id(household_snap_c) + id(twc_vitals_current_c);
+                // [単相ワークアラウンド #7 2026-09-26] 引いた分（車の全電流）と同じだけ足し戻す
+                corr_a = id(household_snap_a) + id(twc_vitals_vehicle_current);
+                corr_b = id(household_snap_b) + id(twc_vitals_vehicle_current);
+                corr_c = id(household_snap_c) + id(twc_vitals_vehicle_current);
                 // Never publish below what TWC3 itself measures the car
                 // drawing -- the upstream R1 invariant still applies, and
                 // it also covers a negative (exporting) snapshot.
@@ -1415,6 +1434,14 @@ script:
                     "fve_offset_kw,vitals_a,vitals_b,vitals_c,vitals_vehicle,contactor_closed,car_charging,grace_active,"
                     "slow_corr,vitals_fresh,snap_a,snap_b,snap_c");
               }
+              id(desired_avail_sensor)->publish_state(desired_avail);
+              {
+                static std::string last_mode;
+                if (last_mode != mode_str) {
+                  last_mode = mode_str;
+                  id(twc_mode_sensor)->publish_state(mode_str);
+                }
+              }
               ESP_LOGI("csv",
                   "%u,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%d,%.2f,%.2f,%.2f",
                   now_ms, mode_str, real_a, real_b, real_c,
@@ -1904,6 +1931,39 @@ binary_sensor:
       - script.execute: recompute_ct
 
 sensor:
+
+  # --- 設定値・制御目標の可視化（後から追加） ---
+  # コンパイル時定数。焼き直さない限り変わらない＝「今焼けている値」が見える
+  - platform: template
+    name: "TWC Breaker Limit (config)"
+    unit_of_measurement: "A"
+    device_class: current
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: "return ${twc_breaker_limit_a};"
+
+  - platform: template
+    name: "Main Breaker Limit (config)"
+    unit_of_measurement: "A"
+    device_class: current
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: "return ${main_breaker_limit_a};"
+
+  # recompute_ct から publish される。CSV 15番目と同じ値
+  - platform: template
+    name: "TWC Desired Avail"
+    id: desired_avail_sensor
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 2
+    entity_category: diagnostic
+    update_interval: never
+    filters:
+      - throttle: 5s
   # --- TWC3's own vitals, ground-truth diagnostic (see twc_vitals_ip above) ---
   - platform: template
     name: "TWC Vitals Current L1"
@@ -2384,3 +2444,17 @@ modbus_server:
       - { address: 40007, value_type: U_WORD, read_lambda: "return 0x6300;" }
 
 captive_portal:
+
+# ---------------------------------------------------------------------------
+# [フォーク差分 #6 2026-09-24] 制御則が実際に採用しているモードを HA に出す。
+# HA 側の input_boolean は「操作した値」、これは「ESP が実際に使っている値」。
+# 購読が効いていない（has_state() が false）ときは GRID に落ちるので、
+# 操作と実際の食い違いがここに出る。
+# ---------------------------------------------------------------------------
+text_sensor:
+  - platform: template
+    id: twc_mode_sensor
+    name: "TWC Mode"
+    icon: "mdi:state-machine"
+    entity_category: diagnostic
+    update_interval: never
