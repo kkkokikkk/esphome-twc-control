@@ -195,7 +195,6 @@ substitutions:
   ha_power_a_entity: !secret ha_power_a_entity
   ha_power_b_entity: !secret ha_power_b_entity
   ha_power_c_entity: !secret ha_power_c_entity
-  ha_charge_from_grid_entity: !secret ha_charge_from_grid_entity
 
   # --- TWC3's own local vitals API (diagnostic only, does not drive
   #     control) -- ground-truth of what TWC3 is actually doing
@@ -297,8 +296,8 @@ logger:
 api:
   encryption:
     key: !secret api_encryption_key
-  # Watchdog: without an HA connection we can't trust the mirrored
-  # charge_from_grid either (it could be a stale value) -> fail-safe to 0A.
+  # Watchdog: without an HA connection the HA-mirrored real-current/power
+  # values can't be trusted (they could be stale) -> fail-safe to 0A.
   #
   # IMPORTANT: on_client_connected/disconnected fire for EVERY API client,
   # not just HA -- a diagnostic `esphome logs` session is a second client.
@@ -330,6 +329,8 @@ ota:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  # 2026-10-03 diagnostic: WiFi power save off (ping 35-50% loss, RTT ~1s with good RSSI)
+  power_save_mode: none
 
   # Fallback AP in case it fails to connect -> you can still reach it to reflash/fix it
   ap:
@@ -712,12 +713,14 @@ globals:
 # both from the household-only (car-free) signal, plus the manual
 # fve_offset_kw (number.*_fve_offset in HA).
 #
-# If the HA charge_from_grid entity doesn't have a valid state yet, we
-# safely fall back to GRID mode (more conservative, proven to work).
+# JP fork: GRID/FVE is selected by the ESP-local switch.*_charge_from_grid
+# (restore_mode RESTORE_DEFAULT_ON -> GRID until explicitly turned off),
+# not by a mirrored HA input_boolean -- so it lives under this device in
+# HA and survives HA restarts.
 #
 # Fail-safe: if any of the 6 HA-mirrored entities has been reporting
 # unavailable/unknown continuously for shelly_unavailable_debounce_ms, OR
-# the HA API isn't connected (can't trust the mirrored charge_from_grid),
+# the HA API isn't connected (can't trust the mirrored values),
 # report full consumption (twc_breaker_limit_a) on all phases = 0A for the car.
 # ---------------------------------------------------------------------------
 script:
@@ -773,10 +776,7 @@ script:
           bool shelly_stale = (id(shelly_unavailable_since_ms) != 0) &&
               (now_ms - id(shelly_unavailable_since_ms) >= (uint32_t)${shelly_unavailable_debounce_ms});
 
-          bool grid_mode = true;
-          if (id(charge_from_grid).has_state()) {
-            grid_mode = id(charge_from_grid).state;
-          }
+          const bool grid_mode = id(charge_from_grid).state;
 
           float reported_a, reported_b, reported_c;
           if (!id(twc_control_enabled).state) {
@@ -1538,6 +1538,23 @@ switch:
     on_turn_off:
       - script.execute: recompute_ct
 
+  # JP fork: GRID/FVE mode selector. ON = GRID (charge regardless of
+  # surplus), OFF = FVE (self-balance to zero import). Replaces the upstream
+  # binary_sensor that mirrored an HA input_boolean helper: that helper was
+  # not attached to this device (shown apart from it in HA), and until it
+  # existed and had a state the firmware silently stayed in GRID. Default
+  # ON = GRID, the same conservative fallback as before.
+  - platform: template
+    id: charge_from_grid
+    name: "Charge From Grid"
+    icon: "mdi:transmission-tower"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - script.execute: recompute_ct
+    on_turn_off:
+      - script.execute: recompute_ct
+
   # FVE mode only. When your utility nets import/export across all 3 phases
   # together (aggregate/net billing) rather than settling each phase
   # separately, this averages the household-only (car-free) availability
@@ -1553,7 +1570,7 @@ switch:
     name: "Aggregate Balance Metering"
     icon: "mdi:swap-horizontal-circle-outline"
     optimistic: true
-    restore_mode: RESTORE_DEFAULT_OFF
+    restore_mode: RESTORE_DEFAULT_ON
 
   # --- EXPERIMENTAL, test/zone-steering branch only -----------------------
   # Requested explicitly, based on threshold-probe findings (see that
@@ -1825,7 +1842,7 @@ number:
 # ---------------------------------------------------------------------------
 # Safety-net recompute: recompute_ct is otherwise ONLY triggered by one of
 # the 6 HA-mirrored real-current/power sensors (see "sensor:" below) pushing
-# a new value, an API connect/disconnect, or a charge_from_grid change.
+# a new value, an API connect/disconnect, or a charge_from_grid switch change.
 # Also the ONLY thing that keeps re-checking the unavailable-debounce timer
 # once an entity flips to unavailable and then just stays that way -- that
 # on_value fires once on the transition, but nothing else would fire again
@@ -1921,14 +1938,6 @@ binary_sensor:
     lambda: |-
       if (id(shelly_unavailable_since_ms) == 0) return true;
       return (millis() - id(shelly_unavailable_since_ms)) < (uint32_t)${shelly_unavailable_debounce_ms};
-
-  # --- Mirrors HA's input_boolean.charge_from_grid (single source of truth lives in HA) ---
-  - platform: homeassistant
-    id: charge_from_grid
-    name: "Charge From Grid (mirror)"
-    entity_id: ${ha_charge_from_grid_entity}
-    on_state:
-      - script.execute: recompute_ct
 
 sensor:
 
@@ -2447,9 +2456,8 @@ captive_portal:
 
 # ---------------------------------------------------------------------------
 # [フォーク差分 #6 2026-09-24] 制御則が実際に採用しているモードを HA に出す。
-# HA 側の input_boolean は「操作した値」、これは「ESP が実際に使っている値」。
-# 購読が効いていない（has_state() が false）ときは GRID に落ちるので、
-# 操作と実際の食い違いがここに出る。
+# 差分 #8 以降は切替自体が ESP 側の Charge From Grid スイッチなので、
+# 操作と実際が食い違うことはない。recompute_ct が実際に走らせた結果の確認用。
 # ---------------------------------------------------------------------------
 text_sensor:
   - platform: template
