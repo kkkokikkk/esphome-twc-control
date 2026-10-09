@@ -839,9 +839,17 @@ script:
             // (実測: currentA 7.3 + currentB 8.6 = vehicle 15.9, currentN 15.9)。
             // 単相では両脚に同じ電流が流れるので、按分値ではなく車の全電流を各脚から引く。
             // 修正前は家庭負荷を約 8.6A 過大評価していた (HA 履歴で確認済み)。
-            float household_a = signed_a - id(twc_vitals_vehicle_current);
-            float household_b = signed_b - id(twc_vitals_vehicle_current);
-            float household_c = signed_c - id(twc_vitals_vehicle_current);
+            // [単相ワークアラウンド #10 2026-10-08] 引くのは充電中（car_charging と同じ条件）だけ。
+            // 接続中・非充電でも vitals には 1.1A 程度が出る（実測）。これを引くと余剰を
+            // 1.1A 多く見積もり、余剰が最小電流ぎりぎりのとき「止まる → 再開条件を満たす →
+            // 16A から再開 → また止まる」の発振になる（シミュレーターで確認）。待機中の値は
+            // 家の負荷として扱う（保守側）。
+            const float veh_sub = (id(twc_vitals_contactor_closed) &&
+                                   id(twc_vitals_vehicle_current) >= 2.0f)
+                                      ? id(twc_vitals_vehicle_current) : 0.0f;
+            float household_a = signed_a - veh_sub;
+            float household_b = signed_b - veh_sub;
+            float household_c = signed_c - veh_sub;
 
             // ---- JP fork: slow-meter household snapshot ----------------
             // With a 1s meter, signed_x and vitals_x are effectively
@@ -869,9 +877,10 @@ script:
               // above, so it will not be used additively until vitals is
               // healthy again.
               // [単相ワークアラウンド #7 2026-09-26] #4 と同じく按分値ではなく車の全電流を引く
-              id(household_snap_a) = signed_a - id(twc_vitals_vehicle_current);
-              id(household_snap_b) = signed_b - id(twc_vitals_vehicle_current);
-              id(household_snap_c) = signed_c - id(twc_vitals_vehicle_current);
+              // [#10] 引くのは充電中だけ（上の veh_sub）
+              id(household_snap_a) = signed_a - veh_sub;
+              id(household_snap_b) = signed_b - veh_sub;
+              id(household_snap_c) = signed_c - veh_sub;
             }
             if (slow_corr && !std::isnan(id(household_snap_a))) {
               household_a = id(household_snap_a);
@@ -928,14 +937,22 @@ script:
                 // Never publish below what TWC3 itself measures the car
                 // drawing -- the upstream R1 invariant still applies, and
                 // it also covers a negative (exporting) snapshot.
-                corr_a = std::max(corr_a, id(twc_vitals_current_a));
-                corr_b = std::max(corr_b, id(twc_vitals_current_b));
-                corr_c = std::max(corr_c, id(twc_vitals_current_c));
+                // [単相ワークアラウンド #9 2026-10-08] 下限も按分値ではなく車の全電流（#4 と同じ根）
+                corr_a = std::max(corr_a, id(twc_vitals_vehicle_current));
+                corr_b = std::max(corr_b, id(twc_vitals_vehicle_current));
+                corr_c = std::max(corr_c, id(twc_vitals_vehicle_current));
               } else {
                 // Upstream R1 hard floor (fast meter, or vitals stale).
-                corr_a = std::max(corr_a, id(twc_vitals_current_a));
-                corr_b = std::max(corr_b, id(twc_vitals_current_b));
-                corr_c = std::max(corr_c, id(twc_vitals_current_c));
+                // [単相ワークアラウンド #9 2026-10-08] 上流（3 相）では vitals_current_x ＝
+                // その相を流れる車の全電流なので、売電中は下限が勝って worst = c になり、
+                // reported = c + L - desired → WC は c = desired で止まる。単相では WC が
+                // 車の電流を A/B に按分（≈ c/2）して返すため下限が半分しか効かず、余剰が
+                // c/2〜c の帯域で worst = c - 余剰 に落ちて家庭分を二重に引く（ゾーンも
+                // 作動せず c = Cmax のまま買電）。両脚とも車の全電流を下限にする。
+                // 下限を上げる向きなので WC の相関チェック（自分の電流を下回らない）にも安全側。
+                corr_a = std::max(corr_a, id(twc_vitals_vehicle_current));
+                corr_b = std::max(corr_b, id(twc_vitals_vehicle_current));
+                corr_c = std::max(corr_c, id(twc_vitals_vehicle_current));
               }
             }
 
