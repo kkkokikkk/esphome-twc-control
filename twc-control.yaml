@@ -202,7 +202,9 @@ substitutions:
   #     of Shelly/HA, for correlating against "reported" and Shelly's real
   #     currents while tuning the control algorithm. ---
   twc_vitals_ip: !secret twc_vitals_ip
-  twc_vitals_poll_interval: "2000ms"
+  twc_vitals_poll_interval: "2000ms"   # 上流の名残（#11 以降は未使用）
+  twc_vitals_poll_interval_ms: "2000"  # [#11] 専用タスクの取得周期
+  twc_vitals_http_timeout_ms: "1500"   # [#11] 1 回の取得のタイムアウト（タスク内なのでメインループは止まらない）
 
   # --- JP fork: phase count ----------------------------------------------
   # "3" = upstream (three-phase, phases A/B/C all live).
@@ -288,6 +290,15 @@ esphome:
   name: ${device_name}
   friendly_name: ${friendly_name}
   min_version: 2025.6.0
+  # [JP fork #11 2026-10-15] vitals を専用タスクで取得（twc_vitals_task.h の冒頭に経緯）
+  includes:
+    - twc_vitals_task.h
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          twc_vitals::start("http://${twc_vitals_ip}/api/1/vitals",
+                            ${twc_vitals_poll_interval_ms}, ${twc_vitals_http_timeout_ms});
 
 # USB-C is used for logs/flashing (native USB), RS485 runs on a separate UART1 (GPIO17/18) -> logger doesn't conflict
 logger:
@@ -337,8 +348,9 @@ wifi:
     ssid: "${friendly_name} Fallback"
     password: !secret ap_password
 
-# Direct poll of TWC3's own /api/1/vitals -- diagnostic ground-truth only,
-# does not participate in control (see interval: below).
+# [JP fork #11] vitals はもう http_request では取らない（twc_vitals_task.h の
+# 専用タスクが esp_http_client で取る）。このブロックは esp_http_client と
+# json（ArduinoJson）をビルドに確実に含めるためだけに残す。timeout は未使用。
 http_request:
   timeout: 2s
 
@@ -1367,7 +1379,10 @@ script:
                   pub = twc_breaker - 1.0f;    // increase band
                   zone = "INCREASE";
                 } else {
-                  pub = twc_breaker + 0.20f;   // hold band
+                  // [JP fork #12 2026-10-17] HOLD のオフセットを number にした（上流は +0.20 固定）。
+                  // 2026-10-17 のログで +0.2A でも WC が下げ続け（4 秒で中央 −2.7A）停止の主因に
+                  // なっていた。WC が上げも下げもしない値を HA から変えて実機で探る。
+                  pub = twc_breaker + id(zone_steering_hold_offset_a).state;   // hold band
                   zone = "HOLD";
                 }
               }
@@ -1696,6 +1711,25 @@ number:
     restore_value: true
     initial_value: 0.5
 
+  # [JP fork #12 2026-10-17] HOLD 帯で報告する値 = L + このオフセット。上流は +0.20 固定。
+  # 2026-10-17 のログで L+0.2 でも WC が下げ続けた（停止の主因）ので、WC が
+  # 上げも下げもしない値を HA から探れるようにした。初期値は上流と同じ 0.20
+  # （書き込みだけでは挙動は変わらない）。INCREASE 帯（L−1.0）より下げないこと。
+  - platform: template
+    id: zone_steering_hold_offset_a
+    name: "Zone Steering Hold Offset"
+    icon: "mdi:tune-variant"
+    unit_of_measurement: "A"
+    min_value: -0.9
+    max_value: 1.0
+    step: 0.05
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 0.20
+    on_value:
+      - script.execute: recompute_ct
+
   # How far vitals_vehicle_current has to exceed desired_avail before
   # jumping straight to the HARD STOP band instead of the gentler SLOW
   # DECLINE band -- i.e. how much overshoot is tolerated before giving up
@@ -1875,38 +1909,40 @@ interval:
   # hard floor and the household-only signal in recompute_ct (see there),
   # and also exposed as diagnostic sensors for correlating against
   # "reported" and Shelly's real currents.
-  - interval: ${twc_vitals_poll_interval}
+  #
+  # [JP fork #11 2026-10-15] 取得そのものは twc_vitals_task.h の専用タスク
+  # （コア 0）で行う。ここでは結果を globals に写すだけなので、WC の応答が
+  # 遅くてもメインループ（HA API・RS485 応答）は止まらない。
+  - interval: 200ms
     then:
-      - http_request.get:
-          url: "http://${twc_vitals_ip}/api/1/vitals"
-          capture_response: true
-          on_response:
-            then:
-              - if:
-                  condition:
-                    lambda: "return response->status_code == 200;"
-                  then:
-                    - lambda: |-
-                        json::parse_json(body, [](JsonObject root) -> bool {
-                          if (root["currentA_a"].is<float>()) id(twc_vitals_current_a) = root["currentA_a"];
-                          if (root["currentB_a"].is<float>()) id(twc_vitals_current_b) = root["currentB_a"];
-                          if (root["currentC_a"].is<float>()) id(twc_vitals_current_c) = root["currentC_a"];
-                          if (root["vehicle_current_a"].is<float>()) id(twc_vitals_vehicle_current) = root["vehicle_current_a"];
-                          if (root["contactor_closed"].is<bool>()) id(twc_vitals_contactor_closed) = root["contactor_closed"];
-                          // JP fork: stamp freshness -- the slow-meter
-                          // reconstruction in recompute_ct adds vitals to a
-                          // held snapshot and must not do so with a stale
-                          // value (see twc_vitals_stale_ms).
-                          id(twc_vitals_last_ok_ms) = millis();
-                          return true;
-                        });
-                        ESP_LOGI("vitals", "TWC vitals: A=%.2f B=%.2f C=%.2f vehicle=%.2f contactor=%s",
-                            id(twc_vitals_current_a), id(twc_vitals_current_b), id(twc_vitals_current_c),
-                            id(twc_vitals_vehicle_current), id(twc_vitals_contactor_closed) ? "closed" : "open");
-                  else:
-                    - logger.log:
-                        format: "TWC vitals HTTP error: %d"
-                        args: ["response->status_code"]
+      - lambda: |-
+          static uint32_t last_ok_seq = 0;
+          static uint32_t last_fail_seq = 0;
+          static uint32_t last_fail_log_ms = 0;
+          twc_vitals::Data d;
+          twc_vitals::take(d);
+          if (d.ok_seq != last_ok_seq) {
+            last_ok_seq = d.ok_seq;
+            id(twc_vitals_current_a) = d.a;
+            id(twc_vitals_current_b) = d.b;
+            id(twc_vitals_current_c) = d.c;
+            id(twc_vitals_vehicle_current) = d.vehicle;
+            id(twc_vitals_contactor_closed) = d.contactor;
+            // JP fork: stamp freshness -- the slow-meter reconstruction in
+            // recompute_ct adds vitals to a held snapshot and must not do so
+            // with a stale value (see twc_vitals_stale_ms).
+            id(twc_vitals_last_ok_ms) = millis();
+            ESP_LOGI("vitals", "TWC vitals: A=%.2f B=%.2f C=%.2f vehicle=%.2f contactor=%s (%u ms)",
+                d.a, d.b, d.c, d.vehicle, d.contactor ? "closed" : "open", (unsigned) d.last_ms);
+          }
+          // 失敗が続いてもログが溢れないよう 10 秒に 1 回まで（x は前回ログからの回数）
+          if (d.fail_seq != last_fail_seq && millis() - last_fail_log_ms >= 10000) {
+            const uint32_t n = d.fail_seq - last_fail_seq;
+            last_fail_seq = d.fail_seq;
+            last_fail_log_ms = millis();
+            ESP_LOGW("vitals", "TWC vitals fetch failed x%u (last err %d, %u ms, total %u)",
+                (unsigned) n, d.last_err, (unsigned) d.last_ms, (unsigned) d.fail_seq);
+          }
 
 # ---------------------------------------------------------------------------
 # HA diagnostics -- "connected" reflects the actual API connection to HA
