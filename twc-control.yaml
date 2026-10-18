@@ -1985,7 +1985,7 @@ binary_sensor:
   #     availability check recompute_ct uses for its fail-safe decision --
   #     see shelly_unavailable_since_ms / recompute_ct. ---
   - platform: template
-    name: "Shelly Data Fresh"
+    name: "Grid Meter Data Fresh"
     id: shelly_data_fresh
     device_class: connectivity
     lambda: |-
@@ -2278,8 +2278,11 @@ sensor:
     lambda: "return id(ct3_current_a);"
 
   # --- Real measured data from Shelly (main incomer) ---
+  # [JP fork #13 2026-10-18] HA の表示名だけ実環境（単相 3 線のスマートメーター、
+  # echonetlite2mqtt → HA テンプレート grid_leg1/leg2）に合わせて Shelly から改名。
+  # 内部 id（shelly_*）はフォーク元と同じに残す。
   - platform: template
-    name: "Shelly Real Current L1"
+    name: "Grid Leg1 Current"
     unit_of_measurement: "A"
     device_class: current
     state_class: measurement
@@ -2288,7 +2291,7 @@ sensor:
     lambda: "return id(shelly_a_current);"
 
   - platform: template
-    name: "Shelly Real Current L2"
+    name: "Grid Leg2 Current"
     unit_of_measurement: "A"
     device_class: current
     state_class: measurement
@@ -2297,7 +2300,7 @@ sensor:
     lambda: "return id(shelly_b_current);"
 
   - platform: template
-    name: "Shelly Real Current L3"
+    name: "Grid L3 Current (unused)"
     unit_of_measurement: "A"
     device_class: current
     state_class: measurement
@@ -2307,7 +2310,7 @@ sensor:
 
   # --- Signed active power straight from Shelly (negative = export, positive = import) ---
   - platform: template
-    name: "Shelly Active Power L1"
+    name: "Grid Leg1 Power"
     unit_of_measurement: "W"
     device_class: power
     state_class: measurement
@@ -2316,7 +2319,7 @@ sensor:
     lambda: "return id(shelly_a_power);"
 
   - platform: template
-    name: "Shelly Active Power L2"
+    name: "Grid Leg2 Power"
     unit_of_measurement: "W"
     device_class: power
     state_class: measurement
@@ -2325,7 +2328,7 @@ sensor:
     lambda: "return id(shelly_b_power);"
 
   - platform: template
-    name: "Shelly Active Power L3"
+    name: "Grid L3 Power (unused)"
     unit_of_measurement: "W"
     device_class: power
     state_class: measurement
@@ -2334,7 +2337,7 @@ sensor:
     lambda: "return id(shelly_c_power);"
 
   - platform: template
-    name: "Shelly Time Since Last OK"
+    name: "Grid Meter Time Since Last OK"
     icon: "mdi:timer-alert-outline"
     unit_of_measurement: "ms"
     state_class: measurement
