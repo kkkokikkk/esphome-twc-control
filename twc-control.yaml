@@ -2282,7 +2282,7 @@ sensor:
   # echonetlite2mqtt → HA テンプレート grid_leg1/leg2）に合わせて Shelly から改名。
   # 内部 id（shelly_*）はフォーク元と同じに残す。
   - platform: template
-    name: "Grid Leg1 Current"
+    name: "Grid Current Leg1"
     unit_of_measurement: "A"
     device_class: current
     state_class: measurement
@@ -2291,7 +2291,7 @@ sensor:
     lambda: "return id(shelly_a_current);"
 
   - platform: template
-    name: "Grid Leg2 Current"
+    name: "Grid Current Leg2"
     unit_of_measurement: "A"
     device_class: current
     state_class: measurement
@@ -2300,7 +2300,7 @@ sensor:
     lambda: "return id(shelly_b_current);"
 
   - platform: template
-    name: "Grid L3 Current (unused)"
+    name: "Grid Current Unused L3"
     unit_of_measurement: "A"
     device_class: current
     state_class: measurement
@@ -2310,7 +2310,7 @@ sensor:
 
   # --- Signed active power straight from Shelly (negative = export, positive = import) ---
   - platform: template
-    name: "Grid Leg1 Power"
+    name: "Grid Power Leg1"
     unit_of_measurement: "W"
     device_class: power
     state_class: measurement
@@ -2319,7 +2319,7 @@ sensor:
     lambda: "return id(shelly_a_power);"
 
   - platform: template
-    name: "Grid Leg2 Power"
+    name: "Grid Power Leg2"
     unit_of_measurement: "W"
     device_class: power
     state_class: measurement
@@ -2328,7 +2328,7 @@ sensor:
     lambda: "return id(shelly_b_power);"
 
   - platform: template
-    name: "Grid L3 Power (unused)"
+    name: "Grid Power Unused L3"
     unit_of_measurement: "W"
     device_class: power
     state_class: measurement
