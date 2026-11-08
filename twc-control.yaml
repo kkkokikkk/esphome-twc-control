@@ -1397,7 +1397,13 @@ script:
               } else {
                 // Excess has shrunk back under hard_excess.
                 id(zone_floor_hold_since_ms) = 0;
-                if (actual > target + tol) {
+                // [JP fork #15 2026-11-08] ブレーキを早めに離す：SLOW は実電流が target + Brake Release Margin
+                // （既定 2A）を超えるときだけ。それ以下は HOLD。2026-11-08 10:34・10:38・10:40 に、desired が
+                // 9〜10A あるのに SLOW/DESCEND（L+1.0）の後、HOLD に戻しても WC が遅れて 2〜4A 下げ続け 6A を割って
+                // 停止していた（WC の遅れ 1 段分を見込む）。ブレーキの強さ（L+1.0）と DESCEND（target + hard_excess 超）は
+                // 変えない。margin を tol 以下にすれば従来どおり。下げ終わりが target より最大 margin 高い分、一時的に買電する。
+                const float jp15_release = std::max(tol, id(jp15_brake_release_margin_a).state);
+                if (actual > target + jp15_release) {
                   pub = twc_breaker + effective_excess;   // slow-decline band
                   zone = (effective_excess > brake_excess) ? "SLOW(stuck->1.1A)" : "SLOW";
                   id(zone_brake_until_ms) = now_ms + recovery_hold_ms;
@@ -1781,6 +1787,22 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 180.0
+    on_value:
+      - script.execute: recompute_ct
+  # [JP fork #15 2026-11-08] SLOW（L+1.0）を出すのは実電流が target + これを超えるときだけ（それ以下は HOLD）。
+  # WC の下げの遅れ（1 段 2〜4A）で 6A を割って止まるのを防ぐ。tol 以下で従来どおり
+  - platform: template
+    id: jp15_brake_release_margin_a
+    name: "Brake Release Margin"
+    icon: "mdi:tune-variant"
+    unit_of_measurement: "A"
+    min_value: 0.0
+    max_value: 5.0
+    step: 0.5
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 2.0
     on_value:
       - script.execute: recompute_ct
   # [JP fork #14 v2] desired がこれを割ったら静観せずに止める。0 ＝無効（既定。時間だけで止める）
