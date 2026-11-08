@@ -157,6 +157,8 @@ substitutions:
   # is set higher than min_charge_current_a itself to actually catch it.
   min_charge_current_a: "5.0"
   grace_vitals_threshold_a: "7.0"
+  # [JP fork #14 v2 2026-11-08] 静観期間に desired を持ち上げる下限（J1772 の最小 6A）
+  low_desired_floor_a: "6.0"
   # dither: small always-on alternation so "reported" is never perfectly
   # static for long, even at rest/fail-safe -- a genuinely static value
   # was independently identified (both by us and by the reference
@@ -557,6 +559,11 @@ globals:
   # would defeat the hold) and not by value comparison (a genuinely
   # unchanged reading is still a fresh sample).
   - id: meter_seq
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  # --- [JP fork #14 v2 2026-11-08] 6A キープの静観期間：desired が 6A を割り始めた時刻（0＝割っていない） ---
+  - id: jp14_low_since_ms
     type: uint32_t
     restore_value: no
     initial_value: "0"
@@ -1035,6 +1042,33 @@ script:
               id(desired_avail_last_update_ms) = now_ms;
             }
 
+            // ---- [JP fork #14 v2 2026-11-08] 6A キープの静観期間 ----
+            // 発振の仕組み（2026-11-07 のログ）：余剰が少なく desired が 6A を割って止まる → WC が約 65 秒後に
+            // 15〜16A で再開 → その電流込みで計算した desired が 6A を割る → WC が追随して 6A を割り止まる、の繰り返し。
+            // 対策：充電中に desired が 6A を割っても、Low Desired Hold（既定 180 秒）の間は desired を 6A に
+            // 持ち上げる＝WC が 6A まで降りてくるのを待ち、不足分は買電を許して止めない。ブレーキの強さは従来どおり。
+            // 静観期間が尽きたら持ち上げをやめる（従来どおり止まる）。0 秒で無効。
+            // Low Desired Stop（既定 0＝無効）を設定すると、desired がそれを割った時点で静観をやめる
+            // （曇りで発電が一気に落ちると頻繁に止まるので既定は無効、2026-11-07 ユーザー判断）。
+            // 主幹ブレーカーの保護（下）は必ずこの後に掛かる。スルーの状態（desired_avail_prev）は汚さない。
+            float jp14_desired_raw = desired_avail;   // 下限前の値（TWC Desired Avail Raw）
+            bool jp14_low_hold = false;
+            {
+              const uint32_t hold_ms = (uint32_t)(id(jp14_low_hold_s).state * 1000.0f);
+              if (!grid_mode && car_charging && hold_ms > 0 &&
+                  desired_avail < (float)${low_desired_floor_a}) {
+                if (id(jp14_low_since_ms) == 0) id(jp14_low_since_ms) = now_ms;
+                const float stop_a = id(jp14_low_stop_a).state;   // 0 以下＝無効（時間だけで止める）
+                if ((stop_a <= 0.0f || desired_avail >= stop_a) &&
+                    now_ms - id(jp14_low_since_ms) < hold_ms) {
+                  desired_avail = (float)${low_desired_floor_a};
+                  jp14_low_hold = true;
+                }
+              } else if (!car_charging || desired_avail >= (float)${low_desired_floor_a}) {
+                id(jp14_low_since_ms) = 0;
+              }
+            }
+
             // Main breaker protection, applied AFTER slewing -- instant,
             // never delayed, regardless of mode.
             //
@@ -1074,6 +1108,7 @@ script:
                                         main_breaker - fabsf(household_c));
             }
             desired_avail = std::min(desired_avail, avail_main_min);
+            jp14_desired_raw = std::min(jp14_desired_raw, avail_main_min);   // [#14 v2] 下限前の値にも主幹の制限
 
             // Publication law -- see the comment block above script: for
             // the full design (adapted from
@@ -1464,9 +1499,10 @@ script:
                     "corr_a,corr_b,corr_c,household_a,household_b,household_c,"
                     "desired_avail,worst,o_raw,pub,"
                     "fve_offset_kw,vitals_a,vitals_b,vitals_c,vitals_vehicle,contactor_closed,car_charging,grace_active,"
-                    "slow_corr,vitals_fresh,snap_a,snap_b,snap_c");
+                    "slow_corr,vitals_fresh,snap_a,snap_b,snap_c,low_hold,desired_raw");
               }
               id(desired_avail_sensor)->publish_state(desired_avail);
+              id(desired_avail_raw_sensor)->publish_state(jp14_desired_raw);   // [#14 v2]
               {
                 static std::string last_mode;
                 if (last_mode != mode_str) {
@@ -1475,7 +1511,7 @@ script:
                 }
               }
               ESP_LOGI("csv",
-                  "%u,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%d,%.2f,%.2f,%.2f",
+                  "%u,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%d,%.2f,%.2f,%.2f,%d,%.2f",
                   now_ms, mode_str, real_a, real_b, real_c,
                   signed_a, signed_b, signed_c,
                   corr_a, corr_b, corr_c,
@@ -1485,7 +1521,8 @@ script:
                   id(twc_vitals_vehicle_current), id(twc_vitals_contactor_closed) ? 1 : 0,
                   car_charging ? 1 : 0, grace_active ? 1 : 0,
                   slow_corr ? 1 : 0, vitals_fresh ? 1 : 0,
-                  id(household_snap_a), id(household_snap_b), id(household_snap_c));
+                  id(household_snap_a), id(household_snap_b), id(household_snap_c),
+                  jp14_low_hold ? 1 : 0, jp14_desired_raw);
             }
 
             // Escalation (secondary safety net): a 2-stage STEP function
@@ -1727,6 +1764,38 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 0.20
+    on_value:
+      - script.execute: recompute_ct
+
+  # [JP fork #14 v2] 6A キープの静観期間。充電中に desired が 6A を割っても、この秒数の間は 6A に
+  # 持ち上げて止めない（不足分は買電）。0 で無効
+  - platform: template
+    id: jp14_low_hold_s
+    name: "Low Desired Hold Period"
+    icon: "mdi:timer-sand"
+    unit_of_measurement: "s"
+    min_value: 0.0
+    max_value: 900.0
+    step: 10.0
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 180.0
+    on_value:
+      - script.execute: recompute_ct
+  # [JP fork #14 v2] desired がこれを割ったら静観せずに止める。0 ＝無効（既定。時間だけで止める）
+  - platform: template
+    id: jp14_low_stop_a
+    name: "Low Desired Stop Threshold"
+    icon: "mdi:tune-variant"
+    unit_of_measurement: "A"
+    min_value: 0.0
+    max_value: 6.0
+    step: 0.5
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 0.0
     on_value:
       - script.execute: recompute_ct
 
@@ -2018,6 +2087,19 @@ sensor:
   - platform: template
     name: "TWC Desired Avail"
     id: desired_avail_sensor
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 2
+    entity_category: diagnostic
+    update_interval: never
+    filters:
+      - throttle: 5s
+  # [JP fork #14 v2 2026-11-08] 6A キープの下限を掛ける前の desired（＝本来なら 6A を割っていたかが分かる）。
+  # 静観期間中だけ TWC Desired Avail（6.00）と違う値になる
+  - platform: template
+    name: "TWC Desired Avail Raw"
+    id: desired_avail_raw_sensor
     unit_of_measurement: "A"
     device_class: current
     state_class: measurement
