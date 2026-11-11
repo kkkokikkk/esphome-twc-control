@@ -567,6 +567,27 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: "0"
+  # --- [JP fork #16 2026-11-11] 再開の抑止と再開直後の下げ方 ---
+  - id: jp16_ok_since_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: jp16_prev_charging
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: jp16_charge_start_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: jp16_settle_done
+    type: bool
+    restore_value: no
+    initial_value: "true"
+  - id: jp16_settle_near_since_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
   - id: household_snap_seq
     type: uint32_t
     restore_value: no
@@ -888,6 +909,20 @@ script:
             const bool vitals_fresh = (id(twc_vitals_last_ok_ms) != 0) &&
                 (now_ms - id(twc_vitals_last_ok_ms) <= (uint32_t)${twc_vitals_stale_ms});
             const bool slow_corr = id(slow_meter_corr).state && vitals_fresh;
+            // ---- [JP fork #16 2026-11-11] 再開直後（なじませ期間）の判定 ----
+            // 充電開始から、実電流が HOLD の範囲（target − tol 〜 target + Restart Settle Margin）に 10 秒入るまで
+            // （上限 Restart Settle Max、0 で無効）。この間のゾーン制御は弱いブレーキ＋早めの HOLD（下の zone 部）。
+            // v1（#14、2026-11-07）と同じだが、スナップショットの凍結はしない。
+            const bool jp16_charging_now = id(twc_vitals_contactor_closed) &&
+                (id(twc_vitals_vehicle_current) >= 2.0f);
+            if (jp16_charging_now && !id(jp16_prev_charging)) {
+              id(jp16_charge_start_ms) = now_ms;
+              id(jp16_settle_done) = false;
+              id(jp16_settle_near_since_ms) = 0;
+            }
+            id(jp16_prev_charging) = jp16_charging_now;
+            const bool jp16_settling = jp16_charging_now && !id(jp16_settle_done) &&
+                (now_ms - id(jp16_charge_start_ms) < (uint32_t)(id(jp16_settle_max_s).state * 1000.0f));
             if (id(meter_seq) != id(household_snap_seq)) {
               id(household_snap_seq) = id(meter_seq);
               // Snapshot uses the vitals reading contemporaneous with this
@@ -1351,7 +1386,34 @@ script:
               const float effective_excess = (braking_needed && (now_ms - id(zone_stuck_since_ms)) >= stuck_timeout_ms)
                   ? 1.10f : brake_excess;
 
-              if (actual > target + hard_excess) {
+              // [JP fork #16] 再開直後は弱いブレーキ（L + Restart Settle Brake）＋ target + Restart Settle Margin で HOLD。
+              // 2026-11-11（v2＋#15、再開直後も DESCEND L+1.0）は再開 41 回中 35 回が 7〜60 秒で停止（WC が 15.7→12.7→8.6A と
+              // 下げ、HOLD に戻しても 6A を割る）。v1 の 11/08 は 16 回中 13 回が 120 秒以上続いた。主幹の余裕を超えるときは除く。
+              bool jp16_settle_now = jp16_settling;
+              if (jp16_settle_now) {
+                if (actual >= target - tol && actual <= target + id(jp16_settle_margin_a).state) {
+                  if (id(jp16_settle_near_since_ms) == 0) id(jp16_settle_near_since_ms) = now_ms;
+                  if (now_ms - id(jp16_settle_near_since_ms) >= 10000u) {
+                    id(jp16_settle_done) = true;
+                    jp16_settle_now = false;
+                  }
+                } else {
+                  id(jp16_settle_near_since_ms) = 0;
+                }
+              }
+              if (jp16_settle_now && actual <= avail_main_min) {
+                if (actual > target + id(jp16_settle_margin_a).state) {
+                  pub = twc_breaker + id(jp16_settle_brake_a).state;
+                  zone = "SETTLE_BRAKE";
+                  id(zone_brake_until_ms) = now_ms + recovery_hold_ms;
+                } else if (actual < target - tol && now_ms >= id(zone_brake_until_ms)) {
+                  pub = twc_breaker - 1.0f;
+                  zone = "SETTLE_INCREASE";
+                } else {
+                  pub = twc_breaker + id(zone_steering_hold_offset_a).state;
+                  zone = "SETTLE_HOLD";
+                }
+              } else if (actual > target + hard_excess) {
                 if (actual <= floor_a) {
                   // Requested explicitly: the moment the floor is first
                   // reached, hand off IMMEDIATELY to the classic/natural
@@ -1483,6 +1545,30 @@ script:
             // only the rare near-zero case gets clamped.
             pub = std::max(pub + dither, 0.0f);
 
+            // ---- [JP fork #16 2026-11-11] 再開の抑止 ----
+            // WC は報告値が L 未満になると 2〜3 秒で再開する（余裕 4A 程度でも。2026-11-11 のログ）。再開すると 15〜16A から
+            // 始まるので、余剰が足りないと短時間で止まり発振する。止まっている間（FVE）は、desired（車が流れていないので正確）
+            // が Restart Min Desired（既定 7A、0 で無効）以上を Restart Dwell（既定 30 秒）続けて満たすまで、報告値を L 以上に
+            // 保って再開させない。8:30 のタイマー開始も同じ条件で待つ。
+            bool jp16_block = false;
+            {
+              const float min_a = id(jp16_restart_min_a).state;
+              if (!grid_mode && !car_charging && min_a > 0.0f) {
+                if (jp14_desired_raw >= min_a) {
+                  if (id(jp16_ok_since_ms) == 0) id(jp16_ok_since_ms) = now_ms;
+                } else {
+                  id(jp16_ok_since_ms) = 0;
+                }
+                const uint32_t dwell_ms = (uint32_t)(id(jp16_restart_dwell_s).state * 1000.0f);
+                if (id(jp16_ok_since_ms) == 0 || now_ms - id(jp16_ok_since_ms) < dwell_ms) {
+                  jp16_block = true;
+                  pub = std::max(pub, twc_breaker + 0.05f);
+                }
+              } else {
+                id(jp16_ok_since_ms) = 0;
+              }
+            }
+
             reported_a = reported_b = reported_c = pub;
 
             // DIAGNOSTIC: single-line CSV summary of every decisive value
@@ -1505,7 +1591,7 @@ script:
                     "corr_a,corr_b,corr_c,household_a,household_b,household_c,"
                     "desired_avail,worst,o_raw,pub,"
                     "fve_offset_kw,vitals_a,vitals_b,vitals_c,vitals_vehicle,contactor_closed,car_charging,grace_active,"
-                    "slow_corr,vitals_fresh,snap_a,snap_b,snap_c,low_hold,desired_raw");
+                    "slow_corr,vitals_fresh,snap_a,snap_b,snap_c,low_hold,desired_raw,settle,restart_block");
               }
               id(desired_avail_sensor)->publish_state(desired_avail);
               id(desired_avail_raw_sensor)->publish_state(jp14_desired_raw);   // [#14 v2]
@@ -1517,7 +1603,7 @@ script:
                 }
               }
               ESP_LOGI("csv",
-                  "%u,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%d,%.2f,%.2f,%.2f,%d,%.2f",
+                  "%u,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%d,%.2f,%.2f,%.2f,%d,%.2f,%d,%d",
                   now_ms, mode_str, real_a, real_b, real_c,
                   signed_a, signed_b, signed_c,
                   corr_a, corr_b, corr_c,
@@ -1528,7 +1614,8 @@ script:
                   car_charging ? 1 : 0, grace_active ? 1 : 0,
                   slow_corr ? 1 : 0, vitals_fresh ? 1 : 0,
                   id(household_snap_a), id(household_snap_b), id(household_snap_c),
-                  jp14_low_hold ? 1 : 0, jp14_desired_raw);
+                  jp14_low_hold ? 1 : 0, jp14_desired_raw,
+                  jp16_settling ? 1 : 0, jp16_block ? 1 : 0);
             }
 
             // Escalation (secondary safety net): a 2-stage STEP function
@@ -1791,6 +1878,72 @@ number:
       - script.execute: recompute_ct
   # [JP fork #15 2026-11-08] SLOW（L+1.0）を出すのは実電流が target + これを超えるときだけ（それ以下は HOLD）。
   # WC の下げの遅れ（1 段 2〜4A）で 6A を割って止まるのを防ぐ。tol 以下で従来どおり
+  # [JP fork #16 2026-11-11] 再開の抑止：止まっている間、desired がこれ以上を Restart Dwell 続けるまで再開させない。0 で無効
+  - platform: template
+    id: jp16_restart_min_a
+    name: "Restart Min Desired"
+    icon: "mdi:tune-variant"
+    unit_of_measurement: "A"
+    min_value: 0.0
+    max_value: 16.0
+    step: 0.5
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 7.0
+    on_value:
+      - script.execute: recompute_ct
+  - platform: template
+    id: jp16_restart_dwell_s
+    name: "Restart Dwell"
+    icon: "mdi:timer-sand"
+    unit_of_measurement: "s"
+    min_value: 0.0
+    max_value: 600.0
+    step: 5.0
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 30.0
+  # [JP fork #16] 再開直後のなじませ期間の上限。0 で無効（再開直後も通常のゾーン制御）
+  - platform: template
+    id: jp16_settle_max_s
+    name: "Restart Settle Max"
+    icon: "mdi:timer-sand"
+    unit_of_measurement: "s"
+    min_value: 0.0
+    max_value: 300.0
+    step: 5.0
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 90.0
+  # [JP fork #16] なじませ期間中、実電流が target + これ以下なら HOLD（WC の行き過ぎ 1 段分を見込む）
+  - platform: template
+    id: jp16_settle_margin_a
+    name: "Restart Settle Margin"
+    icon: "mdi:tune-variant"
+    unit_of_measurement: "A"
+    min_value: 0.0
+    max_value: 6.0
+    step: 0.5
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 2.0
+  # [JP fork #16] なじませ期間中のブレーキ（pub = L + これ）。通常の DESCEND/SLOW は +1.0
+  - platform: template
+    id: jp16_settle_brake_a
+    name: "Restart Settle Brake"
+    icon: "mdi:tune-variant"
+    unit_of_measurement: "A"
+    min_value: 0.0
+    max_value: 1.2
+    step: 0.05
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 0.20
   - platform: template
     id: jp15_brake_release_margin_a
     name: "Brake Release Margin"
