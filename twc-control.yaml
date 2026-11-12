@@ -588,6 +588,19 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: "0"
+  # --- [JP fork #17 2026-11-12] パルス状のブレーキ：今のパルスの開始時刻（0＝出していない）と、待ちの終わり ---
+  - id: jp17_pulse_start_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: jp17_wait_until_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: jp17_csv_state
+    type: int
+    restore_value: no
+    initial_value: "0"
   - id: household_snap_seq
     type: uint32_t
     restore_value: no
@@ -1499,6 +1512,42 @@ script:
               // brake-until) still updates every cycle based on the true
               // instantaneous decision -- only the PUBLISHED number is
               // held sticky here.
+              // ---- [JP fork #17 2026-11-12] パルス状のブレーキ ----
+              // WC は報告値が L を超えている間、超過幅に関係なく 約 1A/秒で下げ続ける（L+0.2 でも L+1.0 でも同じ）。
+              // vitals で下がったのを見てから離すと、vitals の 2 秒＋WC の遅れで 5〜6 秒出続け 約 6A 下がり、6A を割って
+              // 停止していた（2026-11-07〜11-12 のログ：5〜6 秒のブレーキ 54 回中 36 回が停止）。
+              // ブレーキ（pub > L）は 1 回 Brake Pulse On（既定 2 秒、0 で無効）まで出し、その後 Brake Pulse Off（既定 4 秒）は
+              // HOLD で待って vitals の結果を見る。まだブレーキが要れば次のパルス。1 回 約 2A に抑える。
+              // 主幹ブレーカーの余裕を超えているときと FLOOR_REACHED の引き渡しはパルスにしない（従来どおり）。
+              int jp17_state = 0;   // CSV 用：0＝パルス対象外、1＝ブレーキ中、2＝待ち
+              {
+                const uint32_t on_ms = (uint32_t)(id(jp17_pulse_on_s).state * 1000.0f);
+                const uint32_t off_ms = (uint32_t)(id(jp17_pulse_off_s).state * 1000.0f);
+                const bool braking = pub > twc_breaker + 0.01f;
+                if (on_ms > 0 && braking && !is_handoff && actual <= avail_main_min) {
+                  if (now_ms < id(jp17_wait_until_ms)) {
+                    pub = twc_breaker + id(zone_steering_hold_offset_a).state;
+                    zone = "PULSE_WAIT";
+                    jp17_state = 2;
+                  } else {
+                    if (id(jp17_pulse_start_ms) == 0) id(jp17_pulse_start_ms) = now_ms;
+                    if (now_ms - id(jp17_pulse_start_ms) >= on_ms) {
+                      id(jp17_pulse_start_ms) = 0;
+                      id(jp17_wait_until_ms) = now_ms + off_ms;
+                      pub = twc_breaker + id(zone_steering_hold_offset_a).state;
+                      zone = "PULSE_WAIT";
+                      jp17_state = 2;
+                    } else {
+                      jp17_state = 1;
+                    }
+                  }
+                } else {
+                  id(jp17_pulse_start_ms) = 0;
+                  if (!braking) id(jp17_wait_until_ms) = 0;
+                }
+              }
+              id(jp17_csv_state) = jp17_state;
+
               const float pub_candidate = pub;
               const uint32_t min_dwell_ms = (uint32_t)(id(zone_steering_min_dwell_s).state * 1000.0f);
               // Bypassed on the exact FLOOR_REACHED handoff cycle -- we
@@ -1591,7 +1640,7 @@ script:
                     "corr_a,corr_b,corr_c,household_a,household_b,household_c,"
                     "desired_avail,worst,o_raw,pub,"
                     "fve_offset_kw,vitals_a,vitals_b,vitals_c,vitals_vehicle,contactor_closed,car_charging,grace_active,"
-                    "slow_corr,vitals_fresh,snap_a,snap_b,snap_c,low_hold,desired_raw,settle,restart_block");
+                    "slow_corr,vitals_fresh,snap_a,snap_b,snap_c,low_hold,desired_raw,settle,restart_block,brake_pulse");
               }
               id(desired_avail_sensor)->publish_state(desired_avail);
               id(desired_avail_raw_sensor)->publish_state(jp14_desired_raw);   // [#14 v2]
@@ -1603,7 +1652,7 @@ script:
                 }
               }
               ESP_LOGI("csv",
-                  "%u,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%d,%.2f,%.2f,%.2f,%d,%.2f,%d,%d",
+                  "%u,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%d,%.2f,%.2f,%.2f,%d,%.2f,%d,%d,%d",
                   now_ms, mode_str, real_a, real_b, real_c,
                   signed_a, signed_b, signed_c,
                   corr_a, corr_b, corr_c,
@@ -1615,7 +1664,8 @@ script:
                   slow_corr ? 1 : 0, vitals_fresh ? 1 : 0,
                   id(household_snap_a), id(household_snap_b), id(household_snap_c),
                   jp14_low_hold ? 1 : 0, jp14_desired_raw,
-                  jp16_settling ? 1 : 0, jp16_block ? 1 : 0);
+                  jp16_settling ? 1 : 0, jp16_block ? 1 : 0,
+                  id(zone_steering_engaged) ? id(jp17_csv_state) : 0);
             }
 
             // Escalation (secondary safety net): a 2-stage STEP function
@@ -1944,6 +1994,31 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 0.20
+  # [JP fork #17 2026-11-12] パルス状のブレーキ：1 回のブレーキの長さ（0 で無効＝従来どおり連続）と、その後の待ち
+  - platform: template
+    id: jp17_pulse_on_s
+    name: "Brake Pulse On"
+    icon: "mdi:timer-sand"
+    unit_of_measurement: "s"
+    min_value: 0.0
+    max_value: 10.0
+    step: 0.5
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 2.0
+  - platform: template
+    id: jp17_pulse_off_s
+    name: "Brake Pulse Off"
+    icon: "mdi:timer-sand"
+    unit_of_measurement: "s"
+    min_value: 0.0
+    max_value: 30.0
+    step: 0.5
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 4.0
   - platform: template
     id: jp15_brake_release_margin_a
     name: "Brake Release Margin"
