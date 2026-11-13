@@ -1570,7 +1570,10 @@ script:
               // firewall, release logic, R1 floor) -- a DECREASE in pub
               // is always accepted instantly; only an INCREASE is
               // dwell-gated.
-              if (is_handoff || std::isnan(id(zone_pub_committed)) ||
+              // [JP fork #17 修正 2026-11-13] パルスのブレーキ中（jp17_state == 1）は待たずに送る。最短保持時間（既定 3 秒）より
+              // パルス（既定 2 秒）が短いと、HOLD → ブレーキの上げが毎回待ちに引っかかり、一度も送られなかった（11/13、
+              // 10:20〜12:00 に 15.7A のまま充電し続けた）。パルス自体が切替の間隔を決めるので、ここで待つ必要は無い。
+              if (is_handoff || jp17_state == 1 || std::isnan(id(zone_pub_committed)) ||
                   std::fabs(pub_candidate - id(zone_pub_committed)) < 0.01f ||
                   pub_candidate <= id(zone_pub_committed) ||
                   now_ms - id(zone_pub_committed_since_ms) >= min_dwell_ms) {
