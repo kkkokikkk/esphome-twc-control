@@ -1096,8 +1096,8 @@ script:
             // 対策：充電中に desired が 6A を割っても、Low Desired Hold（既定 180 秒）の間は desired を 6A に
             // 持ち上げる＝WC が 6A まで降りてくるのを待ち、不足分は買電を許して止めない。ブレーキの強さは従来どおり。
             // 静観期間が尽きたら持ち上げをやめる（従来どおり止まる）。0 秒で無効。
-            // Low Desired Stop（既定 0＝無効）を設定すると、desired がそれを割った時点で静観をやめる
-            // （曇りで発電が一気に落ちると頻繁に止まるので既定は無効、2026-11-07 ユーザー判断）。
+            // [JP fork #18 2026-11-14] desired の値で静観をやめる Low Desired Stop Threshold は削った（既定 0＝無効のまま
+            // 使っておらず、シミュレーターで 3A にすると開始回数が増えた）。時間だけで止める。
             // 主幹ブレーカーの保護（下）は必ずこの後に掛かる。スルーの状態（desired_avail_prev）は汚さない。
             float jp14_desired_raw = desired_avail;   // 下限前の値（TWC Desired Avail Raw）
             bool jp14_low_hold = false;
@@ -1106,9 +1106,7 @@ script:
               if (!grid_mode && car_charging && hold_ms > 0 &&
                   desired_avail < (float)${low_desired_floor_a}) {
                 if (id(jp14_low_since_ms) == 0) id(jp14_low_since_ms) = now_ms;
-                const float stop_a = id(jp14_low_stop_a).state;   // 0 以下＝無効（時間だけで止める）
-                if ((stop_a <= 0.0f || desired_avail >= stop_a) &&
-                    now_ms - id(jp14_low_since_ms) < hold_ms) {
+                if (now_ms - id(jp14_low_since_ms) < hold_ms) {
                   desired_avail = (float)${low_desired_floor_a};
                   jp14_low_hold = true;
                 }
@@ -1472,17 +1470,13 @@ script:
               } else {
                 // Excess has shrunk back under hard_excess.
                 id(zone_floor_hold_since_ms) = 0;
-                // [JP fork #15 2026-11-08] ブレーキを早めに離す：SLOW は実電流が target + Brake Release Margin
-                // （既定 2A）を超えるときだけ。それ以下は HOLD。2026-11-08 10:34・10:38・10:40 に、desired が
-                // 9〜10A あるのに SLOW/DESCEND（L+1.0）の後、HOLD に戻しても WC が遅れて 2〜4A 下げ続け 6A を割って
-                // 停止していた（WC の遅れ 1 段分を見込む）。ブレーキの強さ（L+1.0）と DESCEND（target + hard_excess 超）は
-                // 変えない。margin を tol 以下にすれば従来どおり。下げ終わりが target より最大 margin 高い分、一時的に買電する。
-                const float jp15_release = std::max(tol, id(jp15_brake_release_margin_a).state);
-                if (actual > target + jp15_release) {
-                  pub = twc_breaker + effective_excess;   // slow-decline band
-                  zone = (effective_excess > brake_excess) ? "SLOW(stuck->1.1A)" : "SLOW";
-                  id(zone_brake_until_ms) = now_ms + recovery_hold_ms;
-                } else if (actual < target - tol && now_ms >= id(zone_brake_until_ms)) {
+                // [JP fork #15 2026-11-08 → #18 2026-11-14] ブレーキを早めに離す：実電流が target + hard_excess 以下なら
+                // ブレーキ（SLOW）は出さず HOLD。2026-11-08 10:34・10:38・10:40 に、desired が 9〜10A あるのに SLOW の後、
+                // HOLD に戻しても WC が遅れて 2〜4A 下げ続け 6A を割って停止していた。#15 は Brake Release Margin を超えたら
+                // SLOW だったが、この枝は「実電流 ≤ target + hard_excess」の中なので margin ≥ hard_excess では SLOW は出ず、
+                // 運用の値（margin 4・hard 3）はそれだった。数値を削り、その動きに固定した（#18）。ブレーキは DESCEND
+                // （target + hard_excess 超）だけ。下げ終わりが target より最大 hard_excess 高い分、一時的に買電する。
+                if (actual < target - tol && now_ms >= id(zone_brake_until_ms)) {
                   // Requested explicitly: don't let INCREASE re-engage
                   // immediately after braking -- confirmed live that
                   // with zone_steering_tolerance_a=0, the instant actual
@@ -1522,10 +1516,11 @@ script:
               int jp17_state = 0;   // CSV 用：0＝パルス対象外、1＝ブレーキ中、2＝待ち
               {
                 const uint32_t on_ms = (uint32_t)(id(jp17_pulse_on_s).state * 1000.0f);
-                const uint32_t off_ms = (uint32_t)(id(jp17_pulse_off_s).state * 1000.0f);
+                const uint32_t off_ms = 4000u;   // [JP fork #18] Brake Pulse Off を定数に（2〜10 秒で結果がほぼ同じ）
                 const bool braking = pub > twc_breaker + 0.01f;
                 if (on_ms > 0 && braking && !is_handoff && actual <= avail_main_min) {
-                  if (now_ms < id(jp17_wait_until_ms)) {
+                  // [JP fork #18] 引き算で比べる（now_ms < until だと millis の一周をまたいだとき待ちに貼り付く）。0＝待ちなし
+                  if (id(jp17_wait_until_ms) != 0 && (int32_t)(now_ms - id(jp17_wait_until_ms)) < 0) {
                     pub = twc_breaker + id(zone_steering_hold_offset_a).state;
                     zone = "PULSE_WAIT";
                     jp17_state = 2;
@@ -1997,7 +1992,7 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 0.20
-  # [JP fork #17 2026-11-12] パルス状のブレーキ：1 回のブレーキの長さ（0 で無効＝従来どおり連続）と、その後の待ち
+  # [JP fork #17 2026-11-12] パルス状のブレーキ：1 回のブレーキの長さ（0 で無効＝従来どおり連続）。待ちは 4 秒固定（#18）
   - platform: template
     id: jp17_pulse_on_s
     name: "Brake Pulse On"
@@ -2010,47 +2005,6 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 2.0
-  - platform: template
-    id: jp17_pulse_off_s
-    name: "Brake Pulse Off"
-    icon: "mdi:timer-sand"
-    unit_of_measurement: "s"
-    min_value: 0.0
-    max_value: 30.0
-    step: 0.5
-    mode: box
-    optimistic: true
-    restore_value: true
-    initial_value: 4.0
-  - platform: template
-    id: jp15_brake_release_margin_a
-    name: "Brake Release Margin"
-    icon: "mdi:tune-variant"
-    unit_of_measurement: "A"
-    min_value: 0.0
-    max_value: 5.0
-    step: 0.5
-    mode: box
-    optimistic: true
-    restore_value: true
-    initial_value: 2.0
-    on_value:
-      - script.execute: recompute_ct
-  # [JP fork #14 v2] desired がこれを割ったら静観せずに止める。0 ＝無効（既定。時間だけで止める）
-  - platform: template
-    id: jp14_low_stop_a
-    name: "Low Desired Stop Threshold"
-    icon: "mdi:tune-variant"
-    unit_of_measurement: "A"
-    min_value: 0.0
-    max_value: 6.0
-    step: 0.5
-    mode: box
-    optimistic: true
-    restore_value: true
-    initial_value: 0.0
-    on_value:
-      - script.execute: recompute_ct
 
   # How far vitals_vehicle_current has to exceed desired_avail before
   # jumping straight to the HARD STOP band instead of the gentler SLOW
