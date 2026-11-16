@@ -1028,7 +1028,12 @@ script:
             // loop, no gain needed here at all).
             float desired_avail;
             if (grid_mode) {
-              desired_avail = twc_breaker;
+              // [JP fork #19 2026-11-16] GRID の充電電力を HA から指定（Grid Charge Power、kW）。FVE Offset と同じ
+              // 換算（kW → 1 相あたりの A）。値が未復元（NAN）のときは従来どおり L。L での頭打ちはこの下。
+              const float jp19_grid_kw = id(jp19_grid_charge_kw).state;
+              desired_avail = std::isnan(jp19_grid_kw)
+                  ? twc_breaker
+                  : jp19_grid_kw * 1000.0f / (float)kPhaseCount / voltage;
             } else if (kPhaseCount == 1) {
               // JP fork: single-phase -- phase A IS the whole installation,
               // so there is nothing to average or take a minimum over.
@@ -1476,7 +1481,13 @@ script:
                 // SLOW だったが、この枝は「実電流 ≤ target + hard_excess」の中なので margin ≥ hard_excess では SLOW は出ず、
                 // 運用の値（margin 4・hard 3）はそれだった。数値を削り、その動きに固定した（#18）。ブレーキは DESCEND
                 // （target + hard_excess 超）だけ。下げ終わりが target より最大 hard_excess 高い分、一時的に買電する。
-                if (actual < target - tol && now_ms >= id(zone_brake_until_ms)) {
+                // [JP fork #19 2026-11-16] GRID だけは target + tol 超でブレーキ（SLOW）。target が指定電力で動かないので、
+                // hard_excess（3A＝0.6kW）のずれを残さない。パルス（#17）はこの後に掛かる。
+                if (grid_mode && actual > target + tol) {
+                  pub = twc_breaker + effective_excess;   // slow-decline band
+                  zone = (effective_excess > brake_excess) ? "SLOW(stuck->1.1A)" : "SLOW";
+                  id(zone_brake_until_ms) = now_ms + recovery_hold_ms;
+                } else if (actual < target - tol && now_ms >= id(zone_brake_until_ms)) {
                   // Requested explicitly: don't let INCREASE re-engage
                   // immediately after braking -- confirmed live that
                   // with zone_steering_tolerance_a=0, the instant actual
@@ -1869,6 +1880,24 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 0.0
+    on_value:
+      - script.execute: recompute_ct
+
+  # [JP fork #19 2026-11-16] GRID（Charge From Grid＝ON）のときの充電電力。余剰に関係なくこの電力で充電する。
+  # 下限 1.2kW＝車の最小 6A、上限・初期値 3.2kW＝WC の最大出力 16A（#18 までの GRID と同じ）。
+  # 実際の電力は指定の ±0.2kW（Zone Steering Tolerance 1A）に収まる。FVE では使わない。
+  - platform: template
+    id: jp19_grid_charge_kw
+    name: "Grid Charge Power"
+    icon: "mdi:transmission-tower"
+    unit_of_measurement: "kW"
+    min_value: 1.2
+    max_value: 3.2
+    step: 0.1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 3.2
     on_value:
       - script.execute: recompute_ct
 
