@@ -1060,7 +1060,16 @@ script:
                                          -household_c + fve_offset_a);
               }
             }
+            // [JP fork #20 2026-11-20] Offset を 6A に足りない分だけに使う（Offset Top Up Floor、0 で無効）。
+            // Offset は全相に同じだけ足しているので、余剰だけの値 ＝ 上の値 − fve_offset_a（単相・平均・最小のどれでも同じ）。
+            const float jp20_sur = desired_avail - fve_offset_a;
             desired_avail = std::min(desired_avail, twc_breaker);
+            float jp20_gate = desired_avail;   // 余剰 ＋ Offset（再開の抑止はこちらで見る）
+            const float jp20_floor = id(jp20_topup_floor_a).state;
+            const bool jp20_on = !grid_mode && !std::isnan(jp20_floor) && jp20_floor > 0.0f;
+            if (jp20_on) {
+              desired_avail = std::max(std::min(desired_avail, jp20_floor), std::min(jp20_sur, twc_breaker));
+            }
 
             // Slew-rate limit desired_avail (see desired_avail_slew_down_a_per_s
             // / desired_avail_slew_up_a_per_s above) BEFORE the
@@ -1160,6 +1169,7 @@ script:
             }
             desired_avail = std::min(desired_avail, avail_main_min);
             jp14_desired_raw = std::min(jp14_desired_raw, avail_main_min);   // [#14 v2] 下限前の値にも主幹の制限
+            jp20_gate = std::min(jp20_gate, avail_main_min);   // [#20] 再開判定の値にも主幹の制限
 
             // Publication law -- see the comment block above script: for
             // the full design (adapted from
@@ -1612,7 +1622,8 @@ script:
             {
               const float min_a = id(jp16_restart_min_a).state;
               if (!grid_mode && !car_charging && min_a > 0.0f) {
-                if (jp14_desired_raw >= min_a) {
+                // [JP fork #20] #20 が有効なときは 余剰 ＋ Offset で判定（始める条件は #19 までと同じ）
+                if ((jp20_on ? jp20_gate : jp14_desired_raw) >= min_a) {
                   if (id(jp16_ok_since_ms) == 0) id(jp16_ok_since_ms) = now_ms;
                 } else {
                   id(jp16_ok_since_ms) = 0;
@@ -1898,6 +1909,23 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 3.2
+    on_value:
+      - script.execute: recompute_ct
+
+  # [JP fork #20 2026-11-20] FVE で、余剰がこの電流以上なら FVE Offset を足さず余剰どおりに充電し、
+  # 足りないときだけ Offset を使ってこの電流まで補う。0＝無効（#19 までと同じ：常に 余剰 ＋ Offset）。
+  - platform: template
+    id: jp20_topup_floor_a
+    name: "Offset Top Up Floor"
+    icon: "mdi:tune-variant"
+    unit_of_measurement: "A"
+    min_value: 0.0
+    max_value: 16.0
+    step: 0.5
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 0.0
     on_value:
       - script.execute: recompute_ct
 
