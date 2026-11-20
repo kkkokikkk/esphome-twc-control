@@ -1660,10 +1660,12 @@ script:
                     "corr_a,corr_b,corr_c,household_a,household_b,household_c,"
                     "desired_avail,worst,o_raw,pub,"
                     "fve_offset_kw,vitals_a,vitals_b,vitals_c,vitals_vehicle,contactor_closed,car_charging,grace_active,"
-                    "slow_corr,vitals_fresh,snap_a,snap_b,snap_c,low_hold,desired_raw,settle,restart_block,brake_pulse");
+                    "slow_corr,vitals_fresh,snap_a,snap_b,snap_c,low_hold,desired_raw,settle,restart_block,brake_pulse,"
+                    "desired_start");   // [JP fork #21] 末尾に desired_start
               }
               id(desired_avail_sensor)->publish_state(desired_avail);
               id(desired_avail_raw_sensor)->publish_state(jp14_desired_raw);   // [#14 v2]
+              id(jp21_desired_start_sensor)->publish_state(jp20_gate);   // [JP fork #21] 開始判定の値（余剰＋Offset）
               {
                 static std::string last_mode;
                 if (last_mode != mode_str) {
@@ -1672,7 +1674,7 @@ script:
                 }
               }
               ESP_LOGI("csv",
-                  "%u,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%d,%.2f,%.2f,%.2f,%d,%.2f,%d,%d,%d",
+                  "%u,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%d,%.2f,%.2f,%.2f,%d,%.2f,%d,%d,%d,%.2f",
                   now_ms, mode_str, real_a, real_b, real_c,
                   signed_a, signed_b, signed_c,
                   corr_a, corr_b, corr_c,
@@ -1685,7 +1687,8 @@ script:
                   id(household_snap_a), id(household_snap_b), id(household_snap_c),
                   jp14_low_hold ? 1 : 0, jp14_desired_raw,
                   jp16_settling ? 1 : 0, jp16_block ? 1 : 0,
-                  id(zone_steering_engaged) ? id(jp17_csv_state) : 0);
+                  id(zone_steering_engaged) ? id(jp17_csv_state) : 0,
+                  jp20_gate);   // [JP fork #21]
             }
 
             // Escalation (secondary safety net): a 2-stage STEP function
@@ -2364,6 +2367,19 @@ sensor:
   - platform: template
     name: "TWC Desired Avail Raw"
     id: desired_avail_raw_sensor
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 2
+    entity_category: diagnostic
+    update_interval: never
+    filters:
+      - throttle: 5s
+  # [JP fork #21 2026-11-20] 充電を始める判定（Restart Min Desired 以上が Restart Dwell 続くか）に使う値＝余剰＋FVE Offset
+  # （主幹の制限込み、スルーの前）。#20 から TWC Desired Avail／Raw はこの値ではないので、開始の理由はこちらで見る
+  - platform: template
+    name: "TWC Desired Start"
+    id: jp21_desired_start_sensor
     unit_of_measurement: "A"
     device_class: current
     state_class: measurement
